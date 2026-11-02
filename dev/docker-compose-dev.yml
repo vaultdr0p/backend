@@ -30,7 +30,7 @@ services:
         exec /go/bin/dlv exec ./stellar-disbursement-platform serve --continue --accept-multiclient --headless --listen=:2345 --api-version=2 --log
     depends_on:
       db:
-        condition: service_started
+        condition: service_healthy
   sdp-tss:
     extends:
       file: docker-compose-tss.yml
@@ -40,8 +40,16 @@ services:
       context: ../
       dockerfile: Dockerfile.development
     depends_on:
-      - db
-      - sdp-api
+      db:
+        condition: service_healthy
+      sdp-api:
+        condition: service_started
+    # sdp-api owns the migrations and TSS needs the tables they create
+    # (tss.channel_accounts, tss.submitter_transactions). `service_started`
+    # cannot express "migrations finished", and an HTTP healthcheck on sdp-api
+    # would require curl or wget in the image, so TSS retries instead and
+    # converges as soon as the migrations land.
+    restart: on-failure
   sdp-frontend:
     extends:
       file: docker-compose-frontend.yml

@@ -10,6 +10,18 @@ services:
       - "127.0.0.1:5432:5432"
     volumes:
       - postgres-db:/data/postgres
+    # On a cold volume, initdb takes longer than the 5s sleep that precedes
+    # sdp-api's migration chain, so every migration and then `serve` itself
+    # fails with "connection refused" and the stack comes up against an empty
+    # database. Dependents gate on this instead of `service_started`, which
+    # only waits for the container to exist. pg_isready ships in the postgres
+    # image, so this adds no new dependency.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${DATABASE_NAME:-sdp_mtn}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
   sdp-api:
     image: stellar/stellar-disbursement-platform-backend:${SDP_VERSION:-7.1.0}
     ports:
