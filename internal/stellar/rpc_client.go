@@ -60,6 +60,25 @@ func (w *RPCClientWrapper) GetLatestLedgerSequence(ctx context.Context) (uint32,
 	return resp.Sequence, nil
 }
 
+// GetEvents retrieves contract events from RPC.
+//
+// Errors are wrapped rather than categorised the way SimulateTransaction's are:
+// a getEvents failure is always transport- or range-level (an unreachable
+// server, or a startLedger outside the retention window), never a contract
+// execution failure, so there is no simulation-style taxonomy to apply.
+func (w *RPCClientWrapper) GetEvents(ctx context.Context, request protocol.GetEventsRequest) (*protocol.GetEventsResponse, error) {
+	if w.client == nil {
+		return nil, errors.New("RPC client not initialized")
+	}
+
+	resp, err := w.client.GetEvents(ctx, request)
+	if err != nil {
+		return nil, fmt.Errorf("getting contract events: %w", err)
+	}
+
+	return &resp, nil
+}
+
 func NewHTTPClientWithAuth(authHeaderKey, authHeaderValue string) (*http.Client, error) {
 	if authHeaderKey == "" && authHeaderValue == "" {
 		return http.DefaultClient, nil

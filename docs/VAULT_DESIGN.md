@@ -109,9 +109,13 @@ The contract emits six typed events. Each has its indexed address as a topic.
 | `cancelled` | `recipient` | `amount` | allocation → `CANCELLED` |
 | `withdrawn` | `to` | `amount` | update `vault_state.balance` |
 
-Only events with `InSuccessfulContractCall == true` are applied. RPC also
-reports events from failed contract calls, and applying those would project
-state the ledger never accepted.
+Filtering to `EventType: contract` is what keeps failed invocations out. An
+earlier draft of this document said to check
+`EventInfo.InSuccessfulContractCall`; that field is **deprecated in the SDK
+with no replacement** (`// Deprecated: remove in v24`), because contract events
+are only emitted by successful invocations — a failed call surfaces as a
+`diagnostic` event instead, and those are never requested. Reading the
+deprecated field also fails `golangci-lint` under staticcheck SA1019.
 
 ### 2.3 Cursor storage
 
