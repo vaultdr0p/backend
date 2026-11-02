@@ -10,14 +10,20 @@ services:
       service: sdp-api
     depends_on:
       db:
-        condition: service_started
+        condition: service_healthy
   sdp-tss:
     extends:
       file: docker-compose-tss.yml
       service: sdp-tss
     depends_on:
-      - db
-      - sdp-api
+      db:
+        condition: service_healthy
+      sdp-api:
+        condition: service_started
+    # See the matching comment in docker-compose-dev.yml: sdp-api owns the
+    # migrations and TSS needs the tables they create, so TSS retries until
+    # they exist.
+    restart: on-failure
   sdp-frontend:
     extends:
       file: docker-compose-frontend.yml
