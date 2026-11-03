@@ -25,6 +25,12 @@ import (
 
 const testNetworkPassphrase = "Test SDF Network ; September 2015"
 
+// syntheticSecretKey is deliberately not a real key: it has the S prefix the
+// validators key on, but an all-A body and therefore an invalid checksum. The
+// point is to exercise "a secret key was pasted into a public field" without
+// committing anything that could be mistaken for a usable credential.
+const syntheticSecretKey = "S" + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
 // fakeAccountFetcher stands in for Horizon's account lookup, which supplies
 // the signer's sequence number — the one part of building an envelope that
 // only the network knows.
@@ -167,7 +173,7 @@ func Test_TransactionBuilder_Build_validation(t *testing.T) {
 			// A secret key in a request is a credential leak, not a typo, so
 			// it gets its own pointed message.
 			name:      "a secret key as the source",
-			request:   BuildRequest{Operation: OperationFund, Source: "SBFGFF27Y64ZUGFAIG5AMJGQODZZKV2YQKAVUUA4HAZQCM5V5LGEENW4", Amount: &amount},
+			request:   BuildRequest{Operation: OperationFund, Source: syntheticSecretKey, Amount: &amount},
 			wantField: "source",
 			wantMsg:   "never a secret key",
 		},
@@ -531,7 +537,7 @@ func Test_addressScVal(t *testing.T) {
 		{name: "an account", address: adminAddress},
 		{name: "a contract", address: tokenContractID},
 		{name: "nonsense", address: "nope", wantErr: "not a Stellar address"},
-		{name: "a secret key", address: "SBFGFF27Y64ZUGFAIG5AMJGQODZZKV2YQKAVUUA4HAZQCM5V5LGEENW4", wantErr: "not a Stellar address"},
+		{name: "a secret key", address: syntheticSecretKey, wantErr: "not a Stellar address"},
 	}
 
 	for _, tc := range testCases {

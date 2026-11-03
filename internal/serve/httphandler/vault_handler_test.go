@@ -588,7 +588,9 @@ func Test_VaultHandler_BuildVaultTransaction_rejectsASecretKeyInTheBody(t *testi
 	ctx, models, router := newVaultHandlerTest(t)
 	seedVault(t, ctx, models, time.Now().Add(time.Hour))
 
-	const secretLooking = "SBFGFF27Y64ZUGFAIG5AMJGQODZZKV2YQKAVUUA4HAZQCM5V5LGEENW4"
+	// Deliberately not a real key: the S prefix the validator keys on, with an
+	// all-A body and therefore an invalid checksum.
+	const secretLooking = "S" + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	recorder := doRequest(t, router, http.MethodPost,
 		"/vault/"+testVaultContract+"/transactions",
 		fmt.Sprintf(`{"operation":"fund","amount":"10000000","source":%q}`, secretLooking))
