@@ -23,6 +23,10 @@ func PrometheusMetrics() map[MetricTag]prometheus.Collector {
 		metrics[tag] = counterVec
 	}
 
+	for tag, gaugeVec := range GaugeVecMetrics {
+		metrics[tag] = gaugeVec
+	}
+
 	return metrics
 }
 
@@ -90,5 +94,27 @@ var CounterVecMetrics = map[MetricTag]*prometheus.CounterVec{
 		Help: "A counter of the Circle API requests",
 	},
 		CircleLabelNames,
+	),
+}
+
+// VaultLabelNames are the labels every vault indexer metric carries.
+// contract_id is included because a tenant may run more than one vault, and a
+// single degraded vault must be identifiable rather than averaged away.
+var VaultLabelNames = []string{"tenant_name", "contract_id"}
+
+var GaugeVecMetrics = map[MetricTag]*prometheus.GaugeVec{
+	VaultIndexerLagLedgersTag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: DefaultNamespace, Subsystem: string(VaultSubservice), Name: string(VaultIndexerLagLedgersTag),
+		Help: "Ledgers between the chain tip and the last ledger the vault event indexer has read. " +
+			"Alert when this approaches the RPC event retention window: events beyond it cannot be " +
+			"fetched again, and the recipient list becomes permanently incomplete.",
+	},
+		VaultLabelNames,
+	),
+	VaultIndexerDegradedTag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: DefaultNamespace, Subsystem: string(VaultSubservice), Name: string(VaultIndexerDegradedTag),
+		Help: "1 when a vault has a known, unrecoverable gap in its indexed event history, 0 otherwise.",
+	},
+		VaultLabelNames,
 	),
 }

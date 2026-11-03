@@ -128,6 +128,24 @@ func (_m *MockMonitorService) MonitorDuration(duration time.Duration, tag monito
 	return r0
 }
 
+// MonitorGauge provides a mock function with given fields: value, tag, labels
+func (_m *MockMonitorService) MonitorGauge(value float64, tag monitor.MetricTag, labels map[string]string) error {
+	ret := _m.Called(value, tag, labels)
+
+	if len(ret) == 0 {
+		panic("no return value specified for MonitorGauge")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(float64, monitor.MetricTag, map[string]string) error); ok {
+		r0 = rf(value, tag, labels)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
 // MonitorHistogram provides a mock function with given fields: value, tag, labels
 func (_m *MockMonitorService) MonitorHistogram(value float64, tag monitor.MetricTag, labels map[string]string) error {
 	ret := _m.Called(value, tag, labels)

@@ -47,8 +47,8 @@ func Test_MetricTag_ListAll_IncludesExistingMetrics(t *testing.T) {
 func Test_MetricTag_ListAll_Count(t *testing.T) {
 	allTags := MetricTag("").ListAll()
 
-	// Verify we have all expected metrics (existing + new DB metrics)
-	expectedCount := 8 + 7 // 8 existing + 7 new DB metrics
+	// Verify we have all expected metrics (existing + DB metrics + vault gauges)
+	expectedCount := 8 + 7 + 2 // 8 existing + 7 DB metrics + 2 vault indexer gauges
 	assert.Equal(t, expectedCount, len(allTags),
 		"ListAll() should return %d metrics", expectedCount)
 }
