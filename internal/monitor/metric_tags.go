@@ -31,8 +31,8 @@ const (
 	// distance between the chain tip and how far the indexer has read, and it
 	// goes both up and down. It is the value the retention-window alert is
 	// built on — see internal/vault.LagAlert.
-	VaultIndexerLagLedgersTag MetricTag = "vault_indexer_lag_ledgers"
-	VaultIndexerDegradedTag   MetricTag = "vault_indexer_degraded"
+	VaultIndexerLagLedgersTag MetricTag = "indexer_lag_ledgers"
+	VaultIndexerDegradedTag   MetricTag = "indexer_degraded"
 )
 
 func (m MetricTag) ListAll() []MetricTag {

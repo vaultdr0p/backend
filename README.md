@@ -20,6 +20,7 @@
   - [Core](#core)
   - [Transaction Submission Service](#transaction-submission-service)
   - [Database](#database)
+- [Disbursement Vault](#disbursement-vault)
 - [Wallets](#wallets)
 - [Contributors](#contributors)
   - [State Transitions](#state-transitions)
@@ -380,6 +381,7 @@ The SDP uses Background jobs to handle asynchronous tasks.
 * `payment_to_submitter_job`: This job is used to submit payments from Core to the TSS. Its interval is configured through the `SCHEDULER_PAYMENT_JOB_SECONDS` environment variable.
 * `payment_from_submitter_job`: This job is used to notify Core that a payment has been completed. Its interval is configured through the `SCHEDULER_PAYMENT_JOB_SECONDS` environment variable.
 * `patch_anchor_platform_transactions_completion`: This job is used to patch transactions in Anchor Platform once payments reach the final state 'SUCCESS' or 'FAILED'. Its interval is configured through the `SCHEDULER_PAYMENT_JOB_SECONDS` environment variable.
+* `vault_event_indexer_job`: Indexes the disbursement vault contract's events into each tenant's schema. Registered only when `ENABLE_VAULT=true`; its interval is configured through `VAULT_INDEXER_INTERVAL_SECONDS`. See [Disbursement Vault](#disbursement-vault).
 
 **2. Configuration**
 
@@ -410,6 +412,155 @@ DB_CONN_MAX_LIFETIME_SECONDS=300
 ```
 
 These settings help prevent idle connection buildup across multi-tenant scheduler cycles, especially on constrained databases.
+
+## Disbursement Vault
+
+Optional integration with the Soroban [`disbursement-vault`](https://github.com/vaultdr0p/contract)
+contract: an admin funds a vault with a token, registers recipients with
+amounts, each recipient claims their own allocation, and the admin can cancel
+unclaimed allocations after a deadline and reclaim the funds.
+
+**Disabled by default.** With `ENABLE_VAULT` unset, the vault routes are not
+registered, the indexer job is not scheduled, no RPC calls are made, and no
+code path touches the vault tables. The migration still runs, because
+migrations are not feature-flagged in SDP and four unused tables are harmless.
+
+Design and rationale: [`docs/VAULT_DESIGN.md`](docs/VAULT_DESIGN.md), which
+includes the full OpenAPI 3.1 spec.
+
+### What the backend does, and does not, do
+
+The contract requires the **vault admin's Stellar signature** for `fund`,
+`register`, `cancel` and `withdraw`. SDP never holds that key, so it is
+deliberately **not** a transaction signer for vault operations. It has three
+jobs:
+
+1. **Index** the contract's events into per-tenant Postgres tables.
+2. **Serve** that state over the Dashboard API, under existing auth and tenancy.
+3. **Build** unsigned, pre-simulated transaction envelopes. The browser signs
+   with a wallet and submits; the backend only ever sees XDR.
+
+There is no code path on which SDP could sign a vault operation, because it
+never receives a vault signing key. `claim` envelopes are not offered at all:
+a claim is authorised by the recipient, not the admin.
+
+### Configuration
+
+| Variable | CLI flag | Default | Notes |
+|---|---|---|---|
+| `ENABLE_VAULT` | `--enable-vault` | `false` | Master switch |
+| `VAULT_CONTRACT_ID` | `--vault-contract-id` | *(empty)* | **Required when enabled**; startup fails fast otherwise. A public contract address, not a secret |
+| `VAULT_INDEXER_INTERVAL_SECONDS` | `--vault-indexer-interval-seconds` | `10` | Validated against the minimum job interval |
+| `VAULT_INDEX_FROM_LEDGER` | `--vault-index-from-ledger` | `0` (auto) | Pin a bootstrap ledger. `0` starts at the oldest ledger RPC still serves events for |
+
+Enabling the vault requires `RPC_URL`, since the indexer and the transaction
+builder both need Stellar RPC. RPC credentials reuse the existing
+`RPC_REQUEST_AUTH_HEADER_KEY` / `RPC_REQUEST_AUTH_HEADER_VALUE` settings. **No
+new secret is introduced.**
+
+```sh
+ENABLE_VAULT=true
+VAULT_CONTRACT_ID=CB5HTYC4GZW67ET23SACDCWCCDQ3AKU4TYX7SAUQJSKS6LLQLYA4HG53
+VAULT_INDEXER_INTERVAL_SECONDS=10
+RPC_URL=https://soroban-testnet.stellar.org
+```
+
+### Endpoints
+
+All routes are on the Dashboard API (port 8000), tenant-resolved from the
+request subdomain, and authenticated with the existing dashboard session
+token. Amounts are **decimal strings** everywhere — they are `i128` stroops,
+which exceed both `int64` and IEEE-754 double precision, so parse them with
+`BigInt`, never `Number`.
+
+| Method | Path | Roles | Description |
+|---|---|---|---|
+| `GET` | `/vault/{contract_id}` | owner, financial_controller, business, initiator, approver | Overview: admin, token, deadline, balances, `available`, indexer health |
+| `GET` | `/vault/{contract_id}/allocations` | *same* | Allocations with claim status. Filters: `status`, `recipient`. Paginated |
+| `GET` | `/vault/{contract_id}/allocations/{recipient}` | *same* | One recipient's allocation |
+| `GET` | `/vault/{contract_id}/events` | *same* | Indexed event history, newest first. Filters: `event_type`, `address`. Paginated |
+| `GET` | `/vault/{contract_id}/indexer` | *same* | Indexer health on its own |
+| `POST` | `/vault/{contract_id}/transactions` | owner, financial_controller | Build an unsigned, simulated envelope for `fund`, `register`, `cancel` or `withdraw` |
+| `POST` | `/vault/{contract_id}/resync` | owner | Rewind the indexer cursor and replay |
+
+API keys additionally need the `read:vault` or `write:vault` permission
+(`read:all` / `write:all` also match).
+
+Every list response carries an `indexer` object alongside `data` and
+`pagination`, so a dashboard can show a staleness or degraded banner without a
+second request. A contract id that is not the tenant's configured vault
+returns **404**, as does every route when `ENABLE_VAULT` is off.
+
+A simulation failure is returned as **400** carrying the contract's own typed
+error, so an operation the contract would reject is reported before the user is
+asked to sign:
+
+```json
+{
+  "error": "The vault does not hold enough unallocated funds for this operation.",
+  "extras": { "contract_error_code": 9, "contract_error": "InsufficientFunds" }
+}
+```
+
+### Monitoring the indexer
+
+Two gauges are exported, labelled by `tenant_name` and `contract_id`:
+
+| Metric | Meaning |
+|---|---|
+| `sdp_vault_indexer_lag_ledgers` | Ledgers between the chain tip and the last ledger indexed |
+| `sdp_vault_indexer_degraded` | `1` when the vault has a known, unrecoverable gap in its event history |
+
+**Alert on lag.** Soroban RPC retains contract events for a bounded window —
+measured against `soroban-testnet.stellar.org` as **120,960 ledgers**
+(120,959 observed between `oldestLedger` and `latestLedger` at a 5.00s average
+close time, exactly 7.00 days, matching RPC's `EVENT_LEDGER_RETENTION_WINDOW`
+default). Beyond that window, events cannot be fetched from RPC at all.
+
+The contract exposes `get_allocation(address)` but **no way to enumerate
+recipients**, so the event log is the only source of the recipient set. If the
+indexer falls behind the retention window, the identity of recipients
+registered during the gap is **permanently unrecoverable** — no retry or
+resync can reconstruct it. On-chain funds are never at risk and any known
+recipient can still claim, but SDP's list may be incomplete.
+
+The backend warns at **half** the window (60,480 ledgers, ~3.5 days of
+headroom) in the logs, and errors past the window itself. An equivalent
+Prometheus rule:
+
+```yaml
+groups:
+  - name: sdp-vault
+    rules:
+      - alert: SDPVaultIndexerLagging
+        # Half the RPC event retention window: ~3.5 days of headroom left.
+        expr: sdp_vault_indexer_lag_ledgers > 60480
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Vault indexer for {{ $labels.contract_id }} is more than half the RPC retention window behind"
+
+      - alert: SDPVaultIndexerLosingEvents
+        # Past the window: events are aging out unread, right now.
+        expr: sdp_vault_indexer_lag_ledgers > 120960
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Vault indexer for {{ $labels.contract_id }} is beyond the RPC retention window; recipient registrations are being lost"
+
+      - alert: SDPVaultIndexerDegraded
+        # Independent of lag: a vault can be caught up and still have an
+        # unrecoverable gap from an earlier outage.
+        expr: sdp_vault_indexer_degraded == 1
+        labels: { severity: warning }
+        annotations:
+          summary: "Vault {{ $labels.contract_id }} has an unrecoverable gap in its indexed event history"
+```
+
+If a gap does occur the indexer marks the vault `degraded` with the gap bounds
+and keeps serving known allocations, rather than presenting a partial list as
+if it were whole. `vault_events` is append-only and never pruned, so SDP's own
+history outlives RPC's.
 
 ## Wallets
 
