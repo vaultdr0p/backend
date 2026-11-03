@@ -6,7 +6,10 @@ behaviour.
 
 - **Contract:** `vaultdr0p/contract`, testnet `CB5HTYC4GZW67ET23SACDCWCCDQ3AKU4TYX7SAUQJSKS6LLQLYA4HG53`
 - **Feature flag:** `ENABLE_VAULT`, **default `false`**
-- **Status:** proposed, pending approval. Nothing here is implemented yet.
+- **Status:** approved; implementation in progress on `feat/vault-integration`.
+  Landed so far: the per-tenant migration and `RPCClient.GetEvents` with the
+  retention-window constants. Section 2.2's event filter was corrected during
+  implementation (see the note there).
 
 ---
 
