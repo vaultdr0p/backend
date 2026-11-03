@@ -156,6 +156,29 @@ func (s *ServerService) GetSchedulerJobRegistrars(
 		)
 	}
 
+	// The vault event indexer is scheduled only when the vault is enabled, so
+	// a default deployment makes no RPC calls and touches no vault tables.
+	if serveOpts.EnableVault {
+		rpcClient, rpcErr := di.NewRPCClient(ctx, serveOpts.RPCConfig)
+		if rpcErr != nil {
+			return nil, fmt.Errorf("creating RPC client for the vault indexer: %w", rpcErr)
+		}
+
+		interval := serveOpts.VaultIndexerIntervalSeconds
+		if interval < jobs.DefaultMinimumJobIntervalSeconds {
+			log.Fatalf("VaultIndexerIntervalSeconds is lower than the minimum value of %d", jobs.DefaultMinimumJobIntervalSeconds)
+		}
+
+		sj = append(sj, scheduler.WithVaultEventIndexerJobOption(jobs.VaultEventIndexerJobOptions{
+			JobIntervalSeconds: interval,
+			Models:             models,
+			MonitorService:     serveOpts.MonitorService,
+			RPCClient:          rpcClient,
+			ContractID:         serveOpts.VaultContractID,
+			IndexFromLedger:    uint32(serveOpts.VaultIndexFromLedger),
+		}))
+	}
+
 	return sj, nil
 }
 
@@ -273,6 +296,42 @@ func (c *ServeCommand) Command(serverService ServerServiceInterface, monitorServ
 			CustomSetValue: cmdUtils.SetConfigOptionStellarContractID,
 			ConfigKey:      &serveOpts.Sep45ContractID,
 			Required:       false,
+		},
+		{
+			Name: "enable-vault",
+			Usage: "Enable the disbursement vault integration: indexes the vault contract's events and " +
+				"serves the vault endpoints. Requires --vault-contract-id and Stellar RPC. Defaults to off, " +
+				"in which case the vault routes are not registered and the indexer is not scheduled.",
+			OptType:     types.Bool,
+			ConfigKey:   &serveOpts.EnableVault,
+			FlagDefault: false,
+			Required:    false,
+		},
+		{
+			Name:           "vault-contract-id",
+			Usage:          "The ID of the disbursement vault contract (required when --enable-vault is true)",
+			OptType:        types.String,
+			CustomSetValue: cmdUtils.SetConfigOptionStellarContractID,
+			ConfigKey:      &serveOpts.VaultContractID,
+			Required:       false,
+		},
+		{
+			Name: "vault-indexer-interval-seconds",
+			Usage: "How often the vault event indexer polls Stellar RPC, in seconds. " +
+				"The RPC event retention window is measured in days, so this is about freshness, not safety.",
+			OptType:     types.Int,
+			ConfigKey:   &serveOpts.VaultIndexerIntervalSeconds,
+			FlagDefault: 10,
+			Required:    false,
+		},
+		{
+			Name: "vault-index-from-ledger",
+			Usage: "Ledger to begin indexing the vault from. Defaults to 0, meaning start at the oldest " +
+				"ledger RPC still serves events for. Set this when the vault's deployment ledger is known.",
+			OptType:     types.Int,
+			ConfigKey:   &serveOpts.VaultIndexFromLedger,
+			FlagDefault: 0,
+			Required:    false,
 		},
 		{
 			Name:        "sep10-client-attribution-required",

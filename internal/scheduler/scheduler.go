@@ -257,6 +257,16 @@ func WithPaymentFromSubmitterJobOption(paymentJobInterval int, models *data.Mode
 	}
 }
 
+// WithVaultEventIndexerJobOption registers the vault event indexer. The
+// caller only reaches this when ENABLE_VAULT is true, so with the flag off
+// nothing is scheduled.
+func WithVaultEventIndexerJobOption(opts jobs.VaultEventIndexerJobOptions) SchedulerJobRegisterOption {
+	return func(s *Scheduler) {
+		j := jobs.NewVaultEventIndexerJob(opts)
+		s.addJob(j)
+	}
+}
+
 func WithWalletCreationFromSubmitterJobOption(walletCreationJobInterval int, models *data.Models, tssDBConnectionPool db.DBConnectionPool, networkPassphrase string) SchedulerJobRegisterOption {
 	return func(s *Scheduler) {
 		j := jobs.NewWalletCreationFromSubmitterJob(walletCreationJobInterval, models, tssDBConnectionPool, networkPassphrase)

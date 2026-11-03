@@ -57,6 +57,29 @@ var knownEventTypes = map[EventType]struct{}{
 	EventTypeWithdrawn:   {},
 }
 
+// IsKnownEventType reports whether a name is one of the six events the
+// contract emits. Used to validate an `event_type` query parameter, so an
+// unknown filter is a 400 rather than an empty list that looks like "no such
+// events happened".
+func IsKnownEventType(eventType EventType) bool {
+	_, known := knownEventTypes[eventType]
+	return known
+}
+
+// KnownEventTypeNames lists the event names in the contract's lifecycle order,
+// for error messages. The order is fixed rather than taken from the map so the
+// message is stable between runs.
+func KnownEventTypeNames() []string {
+	return []string{
+		string(EventTypeInitialized),
+		string(EventTypeFunded),
+		string(EventTypeRegistered),
+		string(EventTypeClaimed),
+		string(EventTypeCancelled),
+		string(EventTypeWithdrawn),
+	}
+}
+
 // Event is one decoded vault contract event.
 //
 // The shape is flat rather than a per-type struct because every consumer
