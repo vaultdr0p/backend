@@ -36,8 +36,15 @@ const (
 // load-bearing: a contract upgrade that adds a seventh event would otherwise
 // wedge the indexer permanently, because the cursor could never advance past
 // the first unrecognised event and every subsequent poll would re-fetch and
-// re-fail it. Skipping keeps the cursor moving, and the raw event is still
-// recorded in vault_events, so a later version can replay and project it.
+// re-fail it.
+//
+// A skipped event is counted and logged but **not stored**:
+// vault_events_type_check only accepts the six known types, so recording it
+// would need a migration anyway. Recovering one therefore means adding the
+// type and replaying — which is possible only while the event is still inside
+// the RPC retention window. That is the trade: a wedged indexer loses
+// everything after the unknown event, whereas skipping loses only the unknown
+// events themselves.
 var ErrUnknownEventType = errors.New("unknown vault event type")
 
 // knownEventTypes is the set an incoming event name is checked against.

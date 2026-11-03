@@ -418,6 +418,78 @@ func (m VaultModel) ApplyTotalAllocated(ctx context.Context, sqlExec db.SQLExecu
 	return nil
 }
 
+// The three methods below apply a *delta* rather than an absolute value,
+// because the contract's claimed, cancelled and withdrawn events carry only an
+// amount — unlike funded and registered, which publish the resulting balance
+// and encumbrance. Deriving is exact here (a claim moves precisely `amount`)
+// and is safe only because InsertEvent gates each one to at most once per
+// event_id; applying a delta twice would silently corrupt the totals.
+//
+// Each decrement is floored at zero with GREATEST. That is not defensive
+// noise: vault_state_totals_check rejects a negative total, so after a
+// retention gap — a `claimed` event whose `registered` event aged out — an
+// unclamped decrement would fail the batch forever and wedge the indexer over
+// data the network no longer has. Clamping keeps indexing alive; the vault is
+// already flagged degraded, and the indexer counts the anomaly, so the
+// inconsistency is reported rather than hidden.
+//
+// snapshot_ledger moves with GREATEST too, so a replay of older events cannot
+// drag it backwards.
+
+// ApplyClaim moves an amount from allocated to claimed, and out of the
+// balance, from a `claimed` event.
+func (m VaultModel) ApplyClaim(ctx context.Context, sqlExec db.SQLExecuter, contractID string, amount VaultAmount, ledger int32) error {
+	const query = `
+		UPDATE vault_state
+		SET total_claimed   = total_claimed + $1,
+		    total_allocated = GREATEST(0, total_allocated - $1),
+		    balance         = GREATEST(0, balance - $1),
+		    snapshot_ledger = GREATEST(snapshot_ledger, $2),
+		    refreshed_at    = NOW()
+		WHERE contract_id = $3`
+
+	if _, err := sqlExec.ExecContext(ctx, query, amount, ledger, contractID); err != nil {
+		return fmt.Errorf("applying vault claim for %s: %w", contractID, err)
+	}
+
+	return nil
+}
+
+// ApplyCancellation releases an encumbrance from a `cancelled` event. No
+// tokens move, so the balance is untouched.
+func (m VaultModel) ApplyCancellation(ctx context.Context, sqlExec db.SQLExecuter, contractID string, amount VaultAmount, ledger int32) error {
+	const query = `
+		UPDATE vault_state
+		SET total_allocated = GREATEST(0, total_allocated - $1),
+		    snapshot_ledger = GREATEST(snapshot_ledger, $2),
+		    refreshed_at    = NOW()
+		WHERE contract_id = $3`
+
+	if _, err := sqlExec.ExecContext(ctx, query, amount, ledger, contractID); err != nil {
+		return fmt.Errorf("applying vault cancellation for %s: %w", contractID, err)
+	}
+
+	return nil
+}
+
+// ApplyWithdrawal reduces the balance from a `withdrawn` event. The contract
+// caps a withdrawal at balance - total_allocated, so this can never consume
+// tokens owed to a pending allocation.
+func (m VaultModel) ApplyWithdrawal(ctx context.Context, sqlExec db.SQLExecuter, contractID string, amount VaultAmount, ledger int32) error {
+	const query = `
+		UPDATE vault_state
+		SET balance         = GREATEST(0, balance - $1),
+		    snapshot_ledger = GREATEST(snapshot_ledger, $2),
+		    refreshed_at    = NOW()
+		WHERE contract_id = $3`
+
+	if _, err := sqlExec.ExecContext(ctx, query, amount, ledger, contractID); err != nil {
+		return fmt.Errorf("applying vault withdrawal for %s: %w", contractID, err)
+	}
+
+	return nil
+}
+
 // GetState reads the cached snapshot, returning ErrRecordNotFound when the
 // vault has not been indexed yet.
 func (m VaultModel) GetState(ctx context.Context, sqlExec db.SQLExecuter, contractID string) (*VaultState, error) {
