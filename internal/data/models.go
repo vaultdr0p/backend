@@ -37,6 +37,7 @@ type Models struct {
 	APIKeys                     *APIKeyModel
 	SEPNonces                   *SEPNonceModel
 	PasskeySessions             *PasskeySessionModel
+	Vault                       *VaultModel
 	DBConnectionPool            db.DBConnectionPool
 }
 
@@ -68,6 +69,7 @@ func NewModels(dbConnectionPool db.DBConnectionPool) (*Models, error) {
 		URLShortener:                NewURLShortenerModel(dbConnectionPool),
 		SEPNonces:                   NewSEPNonceModel(dbConnectionPool),
 		PasskeySessions:             NewPasskeySessionModel(dbConnectionPool),
+		Vault:                       &VaultModel{dbConnectionPool: dbConnectionPool},
 		DBConnectionPool:            dbConnectionPool,
 	}, nil
 }
