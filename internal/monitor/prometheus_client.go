@@ -65,6 +65,11 @@ func (p *prometheusClient) MonitorHistogram(value float64, tag MetricTag, labels
 	histogram.With(labels).Observe(value)
 }
 
+func (p *prometheusClient) MonitorGauge(value float64, tag MetricTag, labels map[string]string) {
+	gauge := GaugeVecMetrics[tag]
+	gauge.With(labels).Set(value)
+}
+
 func (p *prometheusClient) RegisterFunctionMetric(metricType FuncMetricType, opts FuncMetricOptions) {
 	var metric prometheus.Collector
 

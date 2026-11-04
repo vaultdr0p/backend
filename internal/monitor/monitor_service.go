@@ -18,6 +18,7 @@ const (
 	CircleSubservice   Subservice = "circle"
 	AnchorSubservice   Subservice = "anchor_platform"
 	BusinessSubservice Subservice = "business"
+	VaultSubservice    Subservice = "vault"
 )
 
 type MonitorServiceInterface interface {
@@ -30,6 +31,7 @@ type MonitorServiceInterface interface {
 	MonitorCounters(tag MetricTag, labels map[string]string) error
 	MonitorDuration(duration time.Duration, tag MetricTag, labels map[string]string) error
 	MonitorHistogram(value float64, tag MetricTag, labels map[string]string) error
+	MonitorGauge(value float64, tag MetricTag, labels map[string]string) error
 }
 
 var _ MonitorServiceInterface = (*MonitorService)(nil)
@@ -105,6 +107,16 @@ func (m *MonitorService) MonitorHistogram(value float64, tag MetricTag, labels m
 	}
 
 	m.MonitorClient.MonitorHistogram(value, tag, labels)
+
+	return nil
+}
+
+func (m *MonitorService) MonitorGauge(value float64, tag MetricTag, labels map[string]string) error {
+	if m.MonitorClient == nil {
+		return fmt.Errorf("client was not initialized")
+	}
+
+	m.MonitorClient.MonitorGauge(value, tag, labels)
 
 	return nil
 }

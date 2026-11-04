@@ -161,6 +161,7 @@ func Test_serve(t *testing.T) {
 		Sep10SigningPrivateKey:         "SBUSPEKAZKLZSWHRSJ2HWDZUK6I3IVDUWA7JJZSGBLZ2WZIUJI7FPNB5",
 		Sep45ContractID:                "CD3LA6RKF5D2FN2R2L57MWXLBRSEWWENE74YBEFZSSGNJRJGICFGQXMX",
 		RPCConfig:                      stellar.RPCOptions{RPCUrl: "https://soroban-testnet.stellar.org"},
+		VaultIndexerIntervalSeconds:    10, // flag default; the vault itself stays off
 		Sep10ClientAttributionRequired: true,
 		ReCAPTCHASiteKey:               "reCAPTCHASiteKey",
 		ReCAPTCHASiteSecretKey:         "reCAPTCHASiteSecretKey",

@@ -37,6 +37,7 @@ import (
 	"github.com/stellar/stellar-disbursement-platform-backend/internal/transactionsubmission/engine"
 	tssservices "github.com/stellar/stellar-disbursement-platform-backend/internal/transactionsubmission/services"
 	"github.com/stellar/stellar-disbursement-platform-backend/internal/utils"
+	"github.com/stellar/stellar-disbursement-platform-backend/internal/vault"
 	"github.com/stellar/stellar-disbursement-platform-backend/internal/wallet"
 	"github.com/stellar/stellar-disbursement-platform-backend/stellar-auth/pkg/auth"
 	authUtils "github.com/stellar/stellar-disbursement-platform-backend/stellar-auth/pkg/utils"
@@ -97,15 +98,28 @@ type ServeOptions struct {
 	EmbeddedWalletsWasmHash        string
 	EnableSep45                    bool
 	Sep45ContractID                string
-	RPCConfig                      stellar.RPCOptions
-	CrashTrackerClient             crashtracker.CrashTrackerClient
-	ReCAPTCHASiteKey               string
-	ReCAPTCHASiteSecretKey         string
-	CAPTCHAType                    validators.CAPTCHAType
-	ReCAPTCHAV3MinScore            float64
-	DisableMFA                     bool
-	DisableReCAPTCHA               bool
-	PasswordValidator              *authUtils.PasswordValidator
+
+	// EnableVault is the master switch for the disbursement vault
+	// integration. With it off — the default — vault routes are not
+	// registered, the indexer job is not scheduled, and no code path touches
+	// the vault tables, so an existing deployment behaves exactly as before.
+	EnableVault                 bool
+	VaultContractID             string
+	VaultIndexerIntervalSeconds int
+	VaultIndexFromLedger        int
+	// vaultTransactionBuilder is built during SetupDependencies when the
+	// vault is enabled, so the handler does not have to construct it per
+	// request.
+	vaultTransactionBuilder *vault.TransactionBuilder
+	RPCConfig               stellar.RPCOptions
+	CrashTrackerClient      crashtracker.CrashTrackerClient
+	ReCAPTCHASiteKey        string
+	ReCAPTCHASiteSecretKey  string
+	CAPTCHAType             validators.CAPTCHAType
+	ReCAPTCHAV3MinScore     float64
+	DisableMFA              bool
+	DisableReCAPTCHA        bool
+	PasswordValidator       *authUtils.PasswordValidator
 	// LogShippingHook, if set, is flushed during graceful shutdown so
 	// in-flight buffered logs destined for the Loki shipping side-channel
 	// aren't lost. Nil when log shipping (LOG_SHIPPING_URL) isn't configured.
@@ -234,6 +248,28 @@ func (opts *ServeOptions) SetupDependencies() error {
 		opts.Sep45Service = sep45Service
 	}
 
+	if opts.EnableVault {
+		rpcClient, rpcErr := dependencyinjection.NewRPCClient(context.Background(), opts.RPCConfig)
+		if rpcErr != nil {
+			return fmt.Errorf("initializing RPC client for the vault: %w", rpcErr)
+		}
+
+		// Horizon supplies the signer's sequence number, which is the one
+		// piece of building an envelope that only the network knows.
+		vaultBuilder, vaultErr := vault.NewTransactionBuilder(
+			rpcClient,
+			opts.SubmitterEngine.HorizonClient,
+			opts.Models,
+			opts.VaultContractID,
+			opts.NetworkPassphrase,
+		)
+		if vaultErr != nil {
+			return fmt.Errorf("initializing the vault transaction builder: %w", vaultErr)
+		}
+
+		opts.vaultTransactionBuilder = vaultBuilder
+	}
+
 	// Setup the distribution wallet management service (multi-wallet support) when the
 	// secret-management dependencies are configured (always true in production; some test
 	// harnesses omit them, in which case the /distribution-wallets routes are not mounted).
@@ -297,7 +333,7 @@ func (opts *ServeOptions) ValidateRPC() error {
 	}
 
 	// RPC-dependent feature validation
-	hasRPCFeatures := opts.EnableEmbeddedWallets || opts.EnableSep45
+	hasRPCFeatures := opts.EnableEmbeddedWallets || opts.EnableSep45 || opts.EnableVault
 	if hasRPCFeatures && opts.RPCConfig.RPCUrl == "" {
 		return fmt.Errorf("RPC URL must be set when RPC-dependent features are enabled")
 	}
@@ -310,6 +346,14 @@ func (opts *ServeOptions) ValidateRPC() error {
 	// SEP-45 feature validation
 	if opts.EnableSep45 && opts.Sep45ContractID == "" {
 		return fmt.Errorf("SEP-45 contract ID must be set when SEP-45 is enabled")
+	}
+
+	// Disbursement vault feature validation. Failing fast at startup is
+	// deliberate: a vault enabled without a contract id would register routes
+	// that can only ever 404 and schedule an indexer with nothing to index,
+	// which is far harder to diagnose than a refusal to boot.
+	if opts.EnableVault && opts.VaultContractID == "" {
+		return fmt.Errorf("vault contract ID must be set when the vault is enabled")
 	}
 
 	return nil
@@ -931,6 +975,62 @@ func handleHTTP(o ServeOptions) *chi.Mux {
 						})
 					}
 				})
+			})
+		}
+
+		// Disbursement vault endpoints.
+		//
+		// Registered only when ENABLE_VAULT is true, so with the flag off they
+		// return 404 rather than 403. That is deliberate: the dashboard can
+		// feature-detect the vault with a single call, and an operator who
+		// never enabled the vault sees no trace of it.
+		if o.EnableVault {
+			vaultHandler := httphandler.VaultHandler{
+				Models:             o.Models,
+				ContractID:         o.VaultContractID,
+				NetworkPassphrase:  o.NetworkPassphrase,
+				TransactionBuilder: o.vaultTransactionBuilder,
+			}
+
+			r.Route("/vault/{contract_id}", func(r chi.Router) {
+				// Reads use the same role set as disbursement reads: anyone
+				// who can see where money is going can see the vault it comes
+				// from.
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.RequirePermission(
+						data.ReadVault,
+						middleware.AnyRoleMiddleware(authManager,
+							data.OwnerUserRole,
+							data.FinancialControllerUserRole,
+							data.BusinessUserRole,
+							data.InitiatorUserRole,
+							data.ApproverUserRole,
+						),
+					))
+
+					r.Get("/", vaultHandler.GetVault)
+					r.Get("/allocations", vaultHandler.GetVaultAllocations)
+					r.Get("/allocations/{recipient}", vaultHandler.GetVaultAllocation)
+					r.Get("/events", vaultHandler.GetVaultEvents)
+					r.Get("/indexer", vaultHandler.GetVaultIndexer)
+				})
+
+				// Envelope construction is restricted to the two
+				// money-movement roles, mirroring disbursement creation. The
+				// envelope is unsigned and therefore inert without the admin's
+				// key, so this is defence in depth rather than the control
+				// that protects the funds.
+				r.With(middleware.RequirePermission(
+					data.WriteVault,
+					middleware.AnyRoleMiddleware(authManager, data.OwnerUserRole, data.FinancialControllerUserRole),
+				)).Post("/transactions", vaultHandler.BuildVaultTransaction)
+
+				// Resync rewinds the indexer. It is safe at any time, but it
+				// is an operational lever, so it is owner-only.
+				r.With(middleware.RequirePermission(
+					data.WriteVault,
+					middleware.AnyRoleMiddleware(authManager, data.OwnerUserRole),
+				)).Post("/resync", vaultHandler.ResyncVault)
 			})
 		}
 

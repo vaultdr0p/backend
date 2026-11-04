@@ -72,6 +72,11 @@ func (_m *MockMonitorClient) MonitorHistogram(value float64, tag MetricTag, labe
 	_m.Called(value, tag, labels)
 }
 
+// MonitorGauge provides a mock function with given fields: value, tag, labels
+func (_m *MockMonitorClient) MonitorGauge(value float64, tag MetricTag, labels map[string]string) {
+	_m.Called(value, tag, labels)
+}
+
 // MonitorHttpRequestDuration provides a mock function with given fields: duration, labels
 func (_m *MockMonitorClient) MonitorHTTPRequestDuration(duration time.Duration, labels HTTPRequestLabels) {
 	_m.Called(duration, labels)

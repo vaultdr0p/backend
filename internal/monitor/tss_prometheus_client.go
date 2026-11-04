@@ -93,6 +93,18 @@ func (p *tssPrometheusClient) MonitorHistogram(value float64, tag MetricTag, lab
 	histogram.With(labels).Observe(value)
 }
 
+// MonitorGauge is a no-op for TSS. The gauges defined so far belong to the
+// Dashboard API's vault indexer, which TSS does not run; registering them on
+// the TSS registry would export metrics that are always zero and read as a
+// stalled indexer rather than an absent one.
+func (p *tssPrometheusClient) MonitorGauge(value float64, tag MetricTag, labels map[string]string) {
+	gauge, ok := GaugeVecMetrics[tag]
+	if !ok {
+		return
+	}
+	gauge.With(labels).Set(value)
+}
+
 func (p *tssPrometheusClient) RegisterFunctionMetric(metricType FuncMetricType, opts FuncMetricOptions) {
 	var metric prometheus.Collector
 

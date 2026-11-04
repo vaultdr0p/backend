@@ -145,4 +145,24 @@ func isResourceError(err string) bool {
 type RPCClient interface {
 	SimulateTransaction(ctx context.Context, request protocol.SimulateTransactionRequest) (*SimulationResult, *SimulationError)
 	GetLatestLedgerSequence(ctx context.Context) (uint32, error)
+	// GetEvents retrieves contract events. The response reports OldestLedger,
+	// which callers must compare against their own cursor: events older than it
+	// have aged out of the RPC retention window and are gone permanently.
+	GetEvents(ctx context.Context, request protocol.GetEventsRequest) (*protocol.GetEventsResponse, error)
 }
+
+// EventRetentionWindowLedgers is the number of ledgers of contract events a
+// Soroban RPC server keeps. Measured against the configured provider
+// (soroban-testnet.stellar.org) as 120,959 ledgers between oldestLedger and
+// latestLedger at a 5.00s average close time, which is the documented
+// EVENT_LEDGER_RETENTION_WINDOW default of 120,960 ledgers (7 days).
+//
+// Events beyond this window cannot be fetched from RPC at all, which is why
+// vault_events is append-only and never pruned: the database is the durable
+// record once RPC has forgotten.
+const EventRetentionWindowLedgers uint32 = 120_960
+
+// EventRetentionLagWarnLedgers is the indexer lag at which to warn: half the
+// retention window, leaving roughly 3.5 days to intervene before events start
+// aging out unread.
+const EventRetentionLagWarnLedgers uint32 = EventRetentionWindowLedgers / 2

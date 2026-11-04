@@ -73,6 +73,14 @@ const (
 
 	// Reports
 	ReadReports APIKeyPermission = "read:reports"
+
+	// Disbursement vault. These are separate from the disbursement
+	// permissions rather than reused: a vault is a distinct on-chain resource,
+	// and an API key scoped to disbursements should not silently gain the
+	// ability to build vault transactions. Keys holding read:all or write:all
+	// still match, via the prefix rule in HasPermission.
+	ReadVault  APIKeyPermission = "read:vault"
+	WriteVault APIKeyPermission = "write:vault"
 )
 
 // validPermissionsMap is the set of all valid permissions for the validation purposes
@@ -96,6 +104,8 @@ var validPermissionsMap = map[APIKeyPermission]struct{}{
 	ReadStatistics:           {},
 	ReadExports:              {},
 	ReadReports:              {},
+	ReadVault:                {},
+	WriteVault:               {},
 }
 
 type APIKeyPermissions []APIKeyPermission

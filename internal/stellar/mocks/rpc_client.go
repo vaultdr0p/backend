@@ -16,6 +16,36 @@ type MockRPCClient struct {
 	mock.Mock
 }
 
+// GetEvents provides a mock function with given fields: ctx, request
+func (_m *MockRPCClient) GetEvents(ctx context.Context, request protocol.GetEventsRequest) (*protocol.GetEventsResponse, error) {
+	ret := _m.Called(ctx, request)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetEvents")
+	}
+
+	var r0 *protocol.GetEventsResponse
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, protocol.GetEventsRequest) (*protocol.GetEventsResponse, error)); ok {
+		return rf(ctx, request)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, protocol.GetEventsRequest) *protocol.GetEventsResponse); ok {
+		r0 = rf(ctx, request)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*protocol.GetEventsResponse)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, protocol.GetEventsRequest) error); ok {
+		r1 = rf(ctx, request)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
 // SimulateTransaction provides a mock function with given fields: ctx, request
 func (_m *MockRPCClient) SimulateTransaction(ctx context.Context, request protocol.SimulateTransactionRequest) (*stellar.SimulationResult, *stellar.SimulationError) {
 	ret := _m.Called(ctx, request)

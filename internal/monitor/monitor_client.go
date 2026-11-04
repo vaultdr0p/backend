@@ -15,4 +15,7 @@ type MonitorClient interface {
 	MonitorCounters(tag MetricTag, labels map[string]string)
 	MonitorDuration(duration time.Duration, tag MetricTag, labels map[string]string)
 	MonitorHistogram(value float64, tag MetricTag, labels map[string]string)
+	// MonitorGauge sets a gauge to an absolute value. Unlike MonitorCounters
+	// this can go down, which is what a "how far behind are we" metric needs.
+	MonitorGauge(value float64, tag MetricTag, labels map[string]string)
 }
