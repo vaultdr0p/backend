@@ -11,8 +11,49 @@
 
 > Note: you can find a more thorough and user-friendly documentation of this project at [Stellar Docs](https://docs.stellar.org/category/use-the-stellar-disbursement-platform).
 
+## About this fork
+
+This repository is a fork of
+[stellar/stellar-disbursement-platform-backend](https://github.com/stellar/stellar-disbursement-platform-backend),
+the Stellar Disbursement Platform backend built and maintained by the
+[Stellar Development Foundation](https://stellar.org) and its contributors. All
+credit for the platform itself belongs upstream; this fork exists only to add
+the integration described below.
+
+Licensing is unchanged. The project is Apache-2.0 and [`LICENSE`](LICENSE) is
+upstream's file, byte for byte — no copyright notice, attribution or file
+header has been altered or removed, and the badges above still point at the
+upstream project. Everything inherited from upstream is used under the terms of
+that licence.
+
+### What this fork adds
+
+One feature, behind a single flag: the **disbursement vault** integration,
+which connects the SDP to a Soroban vault contract so that allocations and
+claims recorded on-chain are visible through the SDP's own API.
+
+| Addition | What it is |
+|---|---|
+| **Event indexer** | A multi-tenant scheduled job, `vault_event_indexer_job`, that reads the contract's events from Soroban RPC and projects them into each tenant's schema. Idempotent on the RPC event id, with cursor advancement and event inserts in a single database transaction |
+| **Vault tables** | Four tables added by `db/migrations/sdp-migrations/2026-11-02.0-add-vault-tables.sql`: `vault_indexer_state`, `vault_events`, `vault_allocations` and `vault_state` |
+| **HTTP endpoints** | Seven routes under `/vault/{contract_id}` — five reads, plus `POST /transactions` to build an unsigned, simulated envelope and `POST /resync` to rewind the indexer cursor. Gated by the new `read:vault` and `write:vault` permissions |
+| **Lag and gap monitoring** | The `sdp_vault_indexer_lag_ledgers` and `sdp_vault_indexer_degraded` metrics, with alert thresholds derived from the measured RPC event-retention window |
+
+**It is off by default.** With `ENABLE_VAULT` unset, the routes are not
+registered, no job is scheduled and nothing queries the vault tables, so an
+existing deployment behaves exactly as it does upstream.
+
+See [Disbursement Vault](#disbursement-vault) for configuration, the endpoint
+reference and the retention-window caveats, and
+[`docs/VAULT_DESIGN.md`](docs/VAULT_DESIGN.md) for the design rationale.
+
+Nothing else in this fork diverges from upstream by intent. Upstream changes
+are brought in by fetching and merging rather than by rewriting history.
+
 ## Table of Contents
 
+- [About this fork](#about-this-fork)
+  - [What this fork adds](#what-this-fork-adds)
 - [Introduction](#introduction)
 - [Install](#install)
 - [Quick Start](#quick-start)
