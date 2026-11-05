@@ -50,10 +50,26 @@ reference and the retention-window caveats, and
 Nothing else in this fork diverges from upstream by intent. Upstream changes
 are brought in by fetching and merging rather than by rewriting history.
 
+## Status
+
+The vault feature added by this fork is **testnet only and has not been
+audited**. It is not intended for mainnet and must not be used to hold real
+funds. Nothing in this repository is deployed to mainnet by this project.
+
+The Soroban contract it indexes and builds transactions for lives in
+[`vaultdr0p/contract`](https://github.com/vaultdr0p/contract), which is
+unaudited and testnet-only on the same terms.
+
+This applies to the vault feature specifically. The rest of this repository is
+upstream's Stellar Disbursement Platform; its status, support and release
+process are upstream's, not this fork's. Security reports for the fork go
+through [SECURITY.md](SECURITY.md).
+
 ## Table of Contents
 
 - [About this fork](#about-this-fork)
   - [What this fork adds](#what-this-fork-adds)
+- [Status](#status)
 - [Introduction](#introduction)
 - [Install](#install)
 - [Quick Start](#quick-start)

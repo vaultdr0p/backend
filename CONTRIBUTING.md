@@ -61,4 +61,8 @@ All SDP services can be started using the `docker-compose-dev.yml` file in the `
 
 ## Code of Conduct
 
-Help us keep Stellar open and inclusive. Please read and follow our [Code of Conduct](https://github.com/stellar/.github/blob/master/CODE_OF_CONDUCT.md).
+Help us keep this project open and inclusive. Please read and follow our [Code of Conduct](CODE_OF_CONDUCT.md), which is the Contributor Covenant 2.1. Conduct concerns are reported through [GitHub's private vulnerability reporting](https://github.com/vaultdr0p/backend/security/advisories/new), not in a public issue — the Code of Conduct explains why that channel is used. Upstream's [Stellar Code of Conduct](https://github.com/stellar/.github/blob/master/CODE_OF_CONDUCT.md) still applies when you are contributing to upstream.
+
+## Security
+
+Do not report a security vulnerability in a public issue or pull request. See [SECURITY.md](SECURITY.md) for the private reporting channel and what is in scope for this fork.
