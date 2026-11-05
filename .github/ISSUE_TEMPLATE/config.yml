@@ -1,14 +1,20 @@
-blank_issues_enabled: true
+# Blank issues are disabled so that security reports cannot arrive as public
+# issues by the path of least resistance. The links below cover the cases the
+# templates deliberately do not.
+blank_issues_enabled: false
 contact_links:
-  - name: Frontend Project
-    url: https://github.com/stellar/stellar-disbursement-platform-frontend
-    about: The frontend project for this application.
-  - name: Stellar Laboratory
-    url: https://laboratory.stellar.org/#?network=test
-    about: The best place to experiment with the Stellar network.
-  - name: Docker Images
-    url: https://hub.docker.com/r/stellar/stellar-disbursement-platform-backend
-    about: Where to check the available Docker images that have been published.
-  - name: Stellar Ecosystem Proposals (SEPs)
-    url: https://github.com/stellar/stellar-protocol
-    about: The SEPs implemented in this project are defined here.
+  - name: Report a security vulnerability (private)
+    url: https://github.com/vaultdr0p/backend/security/advisories/new
+    about: Never report a vulnerability in a public issue. This stays private until an advisory is published. SECURITY.md explains what is in scope for this fork.
+
+  - name: How to contribute
+    url: https://github.com/vaultdr0p/backend/blob/develop/CONTRIBUTING.md
+    about: Branching, commit and pull request conventions, the local development stack, and the Code of Conduct. Pull requests go to develop.
+
+  - name: Vault contract issues
+    url: https://github.com/vaultdr0p/contract/issues
+    about: This repository is the backend. The Soroban contract it indexes tracks its own issues.
+
+  - name: Dashboard issues
+    url: https://github.com/vaultdr0p/frontend/issues
+    about: The web dashboard that consumes these endpoints tracks its own issues.
