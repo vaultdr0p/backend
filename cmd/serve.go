@@ -334,6 +334,33 @@ func (c *ServeCommand) Command(serverService ServerServiceInterface, monitorServ
 			Required:    false,
 		},
 		{
+			Name: "vault-status-lagging-ledgers",
+			Usage: "Indexer lag, in ledgers, at or above which GET /vault/{contract_id}/status reports \"lagging\". " +
+				"Must be at least 1 and below the RPC event retention window (120960).",
+			OptType:     types.Int,
+			ConfigKey:   &serveOpts.VaultStatusLaggingLedgers,
+			FlagDefault: 60,
+			Required:    false,
+		},
+		{
+			Name: "vault-status-stall-seconds",
+			Usage: "Seconds without an indexer commit after which GET /vault/{contract_id}/status reports \"stalled\". " +
+				"Must be longer than --vault-indexer-interval-seconds.",
+			OptType:     types.Int,
+			ConfigKey:   &serveOpts.VaultStatusStallSeconds,
+			FlagDefault: 300,
+			Required:    false,
+		},
+		{
+			Name: "vault-status-rpc-cache-seconds",
+			Usage: "How long GET /vault/{contract_id}/status caches the RPC latest-ledger lookup, in seconds (1-60). " +
+				"The reported chain tip may be up to this old.",
+			OptType:     types.Int,
+			ConfigKey:   &serveOpts.VaultStatusRPCCacheSeconds,
+			FlagDefault: 5,
+			Required:    false,
+		},
+		{
 			Name:        "sep10-client-attribution-required",
 			Usage:       "If true, SEP-10 authentication requires client_domain to be provided and validated. If false, client_domain is optional.",
 			OptType:     types.Bool,

@@ -48,6 +48,7 @@ var (
 		{http.MethodGet, "/allocations/GCNMZYNV3NVFLK25K3KLZ2LM6HAAD4BVYHULQX746XERD6HQRGGJ6SLD", vaultReadRoles, data.ReadVault},
 		{http.MethodGet, "/events", vaultReadRoles, data.ReadVault},
 		{http.MethodGet, "/indexer", vaultReadRoles, data.ReadVault},
+		{http.MethodGet, "/status", vaultReadRoles, data.ReadVault},
 		{http.MethodPost, "/transactions", []data.UserRole{data.OwnerUserRole, data.FinancialControllerUserRole}, data.WriteVault},
 		{http.MethodPost, "/resync", []data.UserRole{data.OwnerUserRole}, data.WriteVault},
 	}
@@ -61,6 +62,10 @@ func vaultRoutesHandler(t *testing.T, dbConnectionPool db.DBConnectionPool, enab
 	opts := getServeOptionsForTests(t, dbConnectionPool)
 	opts.EnableVault = enableVault
 	opts.VaultContractID = vaultRoutesTestContract
+	opts.VaultIndexerIntervalSeconds = 10
+	opts.VaultStatusLaggingLedgers = 60
+	opts.VaultStatusStallSeconds = 300
+	opts.VaultStatusRPCCacheSeconds = 5
 	if authManager != nil {
 		opts.authManager = authManager
 	}

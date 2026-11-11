@@ -3,6 +3,7 @@ package httphandler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"github.com/stellar/stellar-disbursement-platform-backend/db"
 	"github.com/stellar/stellar-disbursement-platform-backend/db/dbtest"
 	"github.com/stellar/stellar-disbursement-platform-backend/internal/data"
+	"github.com/stellar/stellar-disbursement-platform-backend/internal/vault"
 )
 
 const (
@@ -598,4 +600,189 @@ func Test_VaultHandler_BuildVaultTransaction_rejectsASecretKeyInTheBody(t *testi
 	// The builder is nil in this harness, so the request cannot succeed; what
 	// matters is that the key never appears in the response.
 	assert.NotContains(t, recorder.Body.String(), secretLooking)
+}
+
+// ---------------------------------------------------------------------------
+// GET /vault/{contract_id}/status
+// ---------------------------------------------------------------------------
+
+// fakeTipReader is a scripted chain-tip source for the status handler.
+type fakeTipReader struct {
+	ledger uint32
+	err    error
+}
+
+func (f fakeTipReader) Get(context.Context) (uint32, error) { return f.ledger, f.err }
+
+// hangingTipRPC accepts the call and never answers until its context ends:
+// the RPC failure mode a plain error test misses.
+type hangingTipRPC struct{}
+
+func (hangingTipRPC) GetLatestLedgerSequence(ctx context.Context) (uint32, error) {
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+
+var statusThresholds = vault.HealthThresholds{LaggingLedgers: 60, StallAfter: 300 * time.Second}
+
+func newVaultStatusTest(t *testing.T, tip LatestLedgerReader, now time.Time) (context.Context, *data.Models, http.Handler) {
+	t.Helper()
+
+	dbt := dbtest.Open(t)
+	t.Cleanup(func() { dbt.Close() })
+	dbConnectionPool, err := db.OpenDBConnectionPool(dbt.DSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { dbConnectionPool.Close() })
+	models, err := data.NewModels(dbConnectionPool)
+	require.NoError(t, err)
+
+	handler := VaultHandler{
+		Models:           models,
+		ContractID:       testVaultContract,
+		LatestLedger:     tip,
+		HealthThresholds: statusThresholds,
+		Now:              func() time.Time { return now },
+	}
+	router := chi.NewRouter()
+	router.Route("/vault/{contract_id}", func(r chi.Router) {
+		r.Get("/status", handler.GetVaultStatus)
+	})
+	return context.Background(), models, router
+}
+
+// seededCursor is where seedIndexedVault leaves the indexer.
+const seededCursor int32 = 1000
+
+// seedIndexedVault bootstraps the indexer at seededCursor and commits once, so
+// last_indexed_at is set to the database's NOW().
+func seedIndexedVault(t *testing.T, ctx context.Context, models *data.Models) {
+	t.Helper()
+	cursor := seededCursor
+	_, err := models.Vault.BootstrapIndexerState(ctx, models.DBConnectionPool, data.VaultIndexerState{
+		ContractID: testVaultContract, LastCursor: "", LastLedger: cursor, Status: data.VaultIndexerStatusHealthy,
+	})
+	require.NoError(t, err)
+	require.NoError(t, models.Vault.AdvanceCursor(ctx, models.DBConnectionPool, testVaultContract,
+		fmt.Sprintf("%019d-0000000000", uint64(cursor)<<32), cursor))
+}
+
+func getStatus(t *testing.T, router http.Handler) (int, map[string]any) {
+	t.Helper()
+	recorder := doRequest(t, router, http.MethodGet, "/vault/"+testVaultContract+"/status", "")
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body), recorder.Body.String())
+	return recorder.Code, body
+}
+
+func Test_VaultHandler_GetVaultStatus_ok(t *testing.T) {
+	now := time.Now().UTC()
+	ctx, models, router := newVaultStatusTest(t, fakeTipReader{ledger: 1010}, now)
+	seedIndexedVault(t, ctx, models)
+
+	closedAt := time.Date(2026, 11, 11, 9, 0, 0, 0, time.UTC)
+	amount := data.NewVaultAmount(1)
+	address := testVaultAdminKey
+	_, err := models.Vault.InsertEvent(ctx, models.DBConnectionPool, data.VaultEvent{
+		EventID: "0000004294967296000-0000000000", ContractID: testVaultContract, EventType: "funded",
+		Ledger: 999, LedgerClosedAt: closedAt, TxHash: fmt.Sprintf("%064d", 999),
+		Address: &address, Amount: &amount, Payload: json.RawMessage(`{}`),
+	})
+	require.NoError(t, err)
+
+	code, body := getStatus(t, router)
+	require.Equal(t, http.StatusOK, code)
+
+	assert.Equal(t, testVaultContract, body["contract_id"])
+	assert.Equal(t, "ok", body["status"])
+	assert.Equal(t, "none", body["reason"])
+	assert.NotEmpty(t, body["detail"])
+	assert.Equal(t, false, body["degraded"])
+	assert.EqualValues(t, 1000, body["cursor_ledger"])
+	assert.EqualValues(t, 1010, body["rpc_latest_ledger"])
+	assert.EqualValues(t, 10, body["lag_ledgers"])
+	assert.EqualValues(t, 50, body["lag_seconds_estimate"])
+	assert.EqualValues(t, 120_950, body["retention_headroom"])
+	assert.Equal(t, "2026-11-11T09:00:00Z", body["last_event_at"])
+	assert.Equal(t, now.Format(time.RFC3339Nano), body["checked_at"])
+	assert.Len(t, body, 12)
+}
+
+func Test_VaultHandler_GetVaultStatus_transitions(t *testing.T) {
+	// The DB stamps last_indexed_at with its own NOW(), so "now" for the
+	// handler is expressed relative to the moment of seeding.
+	secretErr := errors.New(`Post "https://rpc.example/?apikey=SUPERSECRET": dial tcp: connection refused`)
+
+	testCases := []struct {
+		name       string
+		seed       bool
+		tip        LatestLedgerReader
+		nowOffset  time.Duration
+		wantStatus string
+		wantReason string
+	}{
+		{"lag at threshold is lagging", true, fakeTipReader{ledger: 1060}, 0, "lagging", "lag_over_threshold"},
+		{"lag threshold-1 is ok", true, fakeTipReader{ledger: 1059}, 0, "ok", "none"},
+		{"no commit for longer than the stall threshold", true, fakeTipReader{ledger: 1000}, 10 * time.Minute, "stalled", "no_recent_commit"},
+		{"never indexed", false, fakeTipReader{ledger: 1000}, 0, "stalled", "never_indexed"},
+		{"rpc unreachable", true, fakeTipReader{err: secretErr}, 0, "stalled", "rpc_unreachable"},
+		{"no tip source configured", true, nil, 0, "stalled", "rpc_unreachable"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now().Add(tc.nowOffset)
+			ctx, models, router := newVaultStatusTest(t, tc.tip, now)
+			if tc.seed {
+				seedIndexedVault(t, ctx, models)
+			}
+
+			code, body := getStatus(t, router)
+			require.Equal(t, http.StatusOK, code, "health results are never a 5xx")
+			assert.Equal(t, tc.wantStatus, body["status"])
+			assert.Equal(t, tc.wantReason, body["reason"])
+
+			if tc.wantReason == "rpc_unreachable" {
+				for _, key := range []string{"rpc_latest_ledger", "lag_ledgers", "lag_seconds_estimate", "retention_headroom"} {
+					assert.Contains(t, body, key)
+					assert.Nil(t, body[key], "%s is null, not zero, when RPC is down", key)
+				}
+				assert.EqualValues(t, 1000, body["cursor_ledger"], "database fields are still served")
+			}
+			if !tc.seed {
+				assert.Nil(t, body["cursor_ledger"])
+			}
+		})
+	}
+
+	t.Run("the RPC error text is never echoed", func(t *testing.T) {
+		ctx, models, router := newVaultStatusTest(t, fakeTipReader{err: secretErr}, time.Now())
+		seedIndexedVault(t, ctx, models)
+		recorder := doRequest(t, router, http.MethodGet, "/vault/"+testVaultContract+"/status", "")
+		assert.NotContains(t, recorder.Body.String(), "SUPERSECRET")
+		assert.NotContains(t, recorder.Body.String(), "rpc.example")
+	})
+}
+
+func Test_VaultHandler_GetVaultStatus_hungRPCThroughTheRealCache(t *testing.T) {
+	cache, err := vault.NewLatestLedgerCache(hangingTipRPC{}, 5*time.Second, 50*time.Millisecond, nil)
+	require.NoError(t, err)
+	ctx, models, router := newVaultStatusTest(t, cache, time.Now())
+	seedIndexedVault(t, ctx, models)
+
+	start := time.Now()
+	code, body := getStatus(t, router)
+	assert.Less(t, time.Since(start), 2*time.Second)
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, "stalled", body["status"])
+	assert.Equal(t, "rpc_unreachable", body["reason"])
+}
+
+func Test_VaultHandler_GetVaultStatus_contractScoping(t *testing.T) {
+	_, _, router := newVaultStatusTest(t, fakeTipReader{ledger: 1}, time.Now())
+
+	recorder := doRequest(t, router, http.MethodGet, "/vault/"+otherContract+"/status", "")
+	assert.Equal(t, http.StatusNotFound, recorder.Code, "another contract does not exist on this tenant")
+
+	recorder = doRequest(t, router, http.MethodGet, "/vault/not-a-contract/status", "")
+	assert.Equal(t, http.StatusBadRequest, recorder.Code)
 }
