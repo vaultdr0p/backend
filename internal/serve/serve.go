@@ -867,6 +867,67 @@ func handleHTTP(o ServeOptions) *chi.Mux {
 			r.Get("/payments", exportHandler.ExportPayments)
 			r.Get("/receivers", exportHandler.ExportReceivers)
 		})
+
+		// Disbursement vault endpoints.
+		//
+		// These must stay inside this authenticated group. RequirePermission and
+		// AnyRoleMiddleware only *check* the API key or JWT that the group's
+		// authenticate middleware puts in the context; mounted anywhere else
+		// they find nothing and reject every caller with 401.
+		//
+		// Registered only when ENABLE_VAULT is true, so with the flag off they
+		// return 404 rather than 403. That is deliberate: the dashboard can
+		// feature-detect the vault with a single call, and an operator who
+		// never enabled the vault sees no trace of it.
+		if o.EnableVault {
+			vaultHandler := httphandler.VaultHandler{
+				Models:             o.Models,
+				ContractID:         o.VaultContractID,
+				NetworkPassphrase:  o.NetworkPassphrase,
+				TransactionBuilder: o.vaultTransactionBuilder,
+			}
+
+			r.Route("/vault/{contract_id}", func(r chi.Router) {
+				// Reads use the same role set as disbursement reads: anyone
+				// who can see where money is going can see the vault it comes
+				// from.
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.RequirePermission(
+						data.ReadVault,
+						middleware.AnyRoleMiddleware(authManager,
+							data.OwnerUserRole,
+							data.FinancialControllerUserRole,
+							data.BusinessUserRole,
+							data.InitiatorUserRole,
+							data.ApproverUserRole,
+						),
+					))
+
+					r.Get("/", vaultHandler.GetVault)
+					r.Get("/allocations", vaultHandler.GetVaultAllocations)
+					r.Get("/allocations/{recipient}", vaultHandler.GetVaultAllocation)
+					r.Get("/events", vaultHandler.GetVaultEvents)
+					r.Get("/indexer", vaultHandler.GetVaultIndexer)
+				})
+
+				// Envelope construction is restricted to the two
+				// money-movement roles, mirroring disbursement creation. The
+				// envelope is unsigned and therefore inert without the admin's
+				// key, so this is defence in depth rather than the control
+				// that protects the funds.
+				r.With(middleware.RequirePermission(
+					data.WriteVault,
+					middleware.AnyRoleMiddleware(authManager, data.OwnerUserRole, data.FinancialControllerUserRole),
+				)).Post("/transactions", vaultHandler.BuildVaultTransaction)
+
+				// Resync rewinds the indexer. It is safe at any time, but it
+				// is an operational lever, so it is owner-only.
+				r.With(middleware.RequirePermission(
+					data.WriteVault,
+					middleware.AnyRoleMiddleware(authManager, data.OwnerUserRole),
+				)).Post("/resync", vaultHandler.ResyncVault)
+			})
+		}
 	})
 
 	captchaFactory := validators.NewCAPTCHAValidatorFactory()
@@ -975,62 +1036,6 @@ func handleHTTP(o ServeOptions) *chi.Mux {
 						})
 					}
 				})
-			})
-		}
-
-		// Disbursement vault endpoints.
-		//
-		// Registered only when ENABLE_VAULT is true, so with the flag off they
-		// return 404 rather than 403. That is deliberate: the dashboard can
-		// feature-detect the vault with a single call, and an operator who
-		// never enabled the vault sees no trace of it.
-		if o.EnableVault {
-			vaultHandler := httphandler.VaultHandler{
-				Models:             o.Models,
-				ContractID:         o.VaultContractID,
-				NetworkPassphrase:  o.NetworkPassphrase,
-				TransactionBuilder: o.vaultTransactionBuilder,
-			}
-
-			r.Route("/vault/{contract_id}", func(r chi.Router) {
-				// Reads use the same role set as disbursement reads: anyone
-				// who can see where money is going can see the vault it comes
-				// from.
-				r.Group(func(r chi.Router) {
-					r.Use(middleware.RequirePermission(
-						data.ReadVault,
-						middleware.AnyRoleMiddleware(authManager,
-							data.OwnerUserRole,
-							data.FinancialControllerUserRole,
-							data.BusinessUserRole,
-							data.InitiatorUserRole,
-							data.ApproverUserRole,
-						),
-					))
-
-					r.Get("/", vaultHandler.GetVault)
-					r.Get("/allocations", vaultHandler.GetVaultAllocations)
-					r.Get("/allocations/{recipient}", vaultHandler.GetVaultAllocation)
-					r.Get("/events", vaultHandler.GetVaultEvents)
-					r.Get("/indexer", vaultHandler.GetVaultIndexer)
-				})
-
-				// Envelope construction is restricted to the two
-				// money-movement roles, mirroring disbursement creation. The
-				// envelope is unsigned and therefore inert without the admin's
-				// key, so this is defence in depth rather than the control
-				// that protects the funds.
-				r.With(middleware.RequirePermission(
-					data.WriteVault,
-					middleware.AnyRoleMiddleware(authManager, data.OwnerUserRole, data.FinancialControllerUserRole),
-				)).Post("/transactions", vaultHandler.BuildVaultTransaction)
-
-				// Resync rewinds the indexer. It is safe at any time, but it
-				// is an operational lever, so it is owner-only.
-				r.With(middleware.RequirePermission(
-					data.WriteVault,
-					middleware.AnyRoleMiddleware(authManager, data.OwnerUserRole),
-				)).Post("/resync", vaultHandler.ResyncVault)
 			})
 		}
 
