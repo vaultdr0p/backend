@@ -669,3 +669,44 @@ func Test_CountPages(t *testing.T) {
 		})
 	}
 }
+
+func Test_VaultModel_GetLastEventAt(t *testing.T) {
+	ctx, dbConnectionPool, m := newVaultTestDB(t)
+	bootstrapVault(t, ctx, dbConnectionPool, m)
+
+	t.Run("no events is nil, not an error", func(t *testing.T) {
+		got, err := m.GetLastEventAt(ctx, dbConnectionPool, testVaultContractID)
+		require.NoError(t, err)
+		assert.Nil(t, got)
+	})
+
+	base := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	at := func(eventType, id string, ledger int32, closedAt time.Time, contractID string) VaultEvent {
+		amount := NewVaultAmount(1)
+		e := newVaultEvent(eventType, id, ledger, testRecipientA, &amount)
+		e.LedgerClosedAt = closedAt
+		e.ContractID = contractID
+		return e
+	}
+
+	// Inserted out of ledger order, so "newest" must come from the ledger,
+	// not from insertion order.
+	for _, e := range []VaultEvent{
+		at("funded", "0000000000000000201-0000000000", 201, base.Add(1*time.Minute), testVaultContractID),
+		at("claimed", "0000000000000000203-0000000000", 203, base.Add(3*time.Minute), testVaultContractID),
+		at("registered", "0000000000000000202-0000000000", 202, base.Add(2*time.Minute), testVaultContractID),
+		// Another contract's newer event must not leak in.
+		at("funded", "0000000000000000999-0000000000", 999, base.Add(time.Hour), testVaultTokenID),
+	} {
+		inserted, err := m.InsertEvent(ctx, dbConnectionPool, e)
+		require.NoError(t, err)
+		require.True(t, inserted)
+	}
+
+	t.Run("newest event by ledger, scoped to the contract", func(t *testing.T) {
+		got, err := m.GetLastEventAt(ctx, dbConnectionPool, testVaultContractID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.True(t, base.Add(3*time.Minute).Equal(*got), "got %s", got)
+	})
+}

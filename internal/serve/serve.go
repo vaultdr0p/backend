@@ -107,19 +107,26 @@ type ServeOptions struct {
 	VaultContractID             string
 	VaultIndexerIntervalSeconds int
 	VaultIndexFromLedger        int
+	// GET /vault/{contract_id}/status thresholds. See docs/VAULT_DESIGN.md §9.
+	VaultStatusLaggingLedgers  int
+	VaultStatusStallSeconds    int
+	VaultStatusRPCCacheSeconds int
 	// vaultTransactionBuilder is built during SetupDependencies when the
 	// vault is enabled, so the handler does not have to construct it per
 	// request.
 	vaultTransactionBuilder *vault.TransactionBuilder
-	RPCConfig               stellar.RPCOptions
-	CrashTrackerClient      crashtracker.CrashTrackerClient
-	ReCAPTCHASiteKey        string
-	ReCAPTCHASiteSecretKey  string
-	CAPTCHAType             validators.CAPTCHAType
-	ReCAPTCHAV3MinScore     float64
-	DisableMFA              bool
-	DisableReCAPTCHA        bool
-	PasswordValidator       *authUtils.PasswordValidator
+	// vaultLatestLedger is the process-wide chain-tip cache behind
+	// GET /status, built in SetupDependencies when the vault is enabled.
+	vaultLatestLedger      *vault.LatestLedgerCache
+	RPCConfig              stellar.RPCOptions
+	CrashTrackerClient     crashtracker.CrashTrackerClient
+	ReCAPTCHASiteKey       string
+	ReCAPTCHASiteSecretKey string
+	CAPTCHAType            validators.CAPTCHAType
+	ReCAPTCHAV3MinScore    float64
+	DisableMFA             bool
+	DisableReCAPTCHA       bool
+	PasswordValidator      *authUtils.PasswordValidator
 	// LogShippingHook, if set, is flushed during graceful shutdown so
 	// in-flight buffered logs destined for the Loki shipping side-channel
 	// aren't lost. Nil when log shipping (LOG_SHIPPING_URL) isn't configured.
@@ -268,6 +275,19 @@ func (opts *ServeOptions) SetupDependencies() error {
 		}
 
 		opts.vaultTransactionBuilder = vaultBuilder
+
+		// One cache for every tenant: the chain tip is public, network-wide
+		// data, so sharing it exposes nothing tenant-specific.
+		latestLedgerCache, cacheErr := vault.NewLatestLedgerCache(
+			rpcClient,
+			time.Duration(opts.VaultStatusRPCCacheSeconds)*time.Second,
+			vault.DefaultLatestLedgerLookupTimeout,
+			nil,
+		)
+		if cacheErr != nil {
+			return fmt.Errorf("initializing the vault latest-ledger cache: %w", cacheErr)
+		}
+		opts.vaultLatestLedger = latestLedgerCache
 	}
 
 	// Setup the distribution wallet management service (multi-wallet support) when the
@@ -354,6 +374,46 @@ func (opts *ServeOptions) ValidateRPC() error {
 	// which is far harder to diagnose than a refusal to boot.
 	if opts.EnableVault && opts.VaultContractID == "" {
 		return fmt.Errorf("vault contract ID must be set when the vault is enabled")
+	}
+
+	if opts.EnableVault {
+		if err := opts.validateVaultStatus(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Bounds for the GET /vault/{contract_id}/status settings.
+const (
+	vaultStatusMinRPCCacheSeconds = 1
+	vaultStatusMaxRPCCacheSeconds = 60
+)
+
+// validateVaultStatus checks the status-endpoint thresholds. Each bound
+// exists because the value outside it would make the endpoint lie:
+//
+//   - a lagging threshold at or past the RPC retention window could only fire
+//     after events have already aged out unread — a post-mortem, not a signal;
+//   - a stall threshold no longer than the indexer interval would flag a
+//     healthy indexer as stalled between two ordinary runs;
+//   - a cache TTL of zero hits RPC on every request, and one over a minute
+//     serves a chain tip a dozen ledgers stale.
+func (opts *ServeOptions) validateVaultStatus() error {
+	if opts.VaultStatusLaggingLedgers < 1 || uint64(opts.VaultStatusLaggingLedgers) >= uint64(stellar.EventRetentionWindowLedgers) {
+		return fmt.Errorf("vault status lagging threshold must be at least 1 and below the RPC event retention window of %d ledgers, got %d",
+			stellar.EventRetentionWindowLedgers, opts.VaultStatusLaggingLedgers)
+	}
+
+	if opts.VaultStatusStallSeconds <= opts.VaultIndexerIntervalSeconds {
+		return fmt.Errorf("vault status stall threshold must be longer than the vault indexer interval (%ds), got %ds",
+			opts.VaultIndexerIntervalSeconds, opts.VaultStatusStallSeconds)
+	}
+
+	if opts.VaultStatusRPCCacheSeconds < vaultStatusMinRPCCacheSeconds || opts.VaultStatusRPCCacheSeconds > vaultStatusMaxRPCCacheSeconds {
+		return fmt.Errorf("vault status RPC cache must be between %d and %d seconds, got %d",
+			vaultStatusMinRPCCacheSeconds, vaultStatusMaxRPCCacheSeconds, opts.VaultStatusRPCCacheSeconds)
 	}
 
 	return nil
@@ -885,6 +945,15 @@ func handleHTTP(o ServeOptions) *chi.Mux {
 				ContractID:         o.VaultContractID,
 				NetworkPassphrase:  o.NetworkPassphrase,
 				TransactionBuilder: o.vaultTransactionBuilder,
+				HealthThresholds: vault.HealthThresholds{
+					LaggingLedgers: uint32(o.VaultStatusLaggingLedgers),
+					StallAfter:     time.Duration(o.VaultStatusStallSeconds) * time.Second,
+				},
+			}
+			// Assigned only when non-nil, so a missing cache stays a nil
+			// interface (reported as rpc_unreachable) rather than a typed nil.
+			if o.vaultLatestLedger != nil {
+				vaultHandler.LatestLedger = o.vaultLatestLedger
 			}
 
 			r.Route("/vault/{contract_id}", func(r chi.Router) {
@@ -908,6 +977,7 @@ func handleHTTP(o ServeOptions) *chi.Mux {
 					r.Get("/allocations/{recipient}", vaultHandler.GetVaultAllocation)
 					r.Get("/events", vaultHandler.GetVaultEvents)
 					r.Get("/indexer", vaultHandler.GetVaultIndexer)
+					r.Get("/status", vaultHandler.GetVaultStatus)
 				})
 
 				// Envelope construction is restricted to the two

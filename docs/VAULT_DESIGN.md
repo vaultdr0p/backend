@@ -522,6 +522,86 @@ components:
             RPC retention window, so the recipient list may be incomplete.
             On-chain funds are unaffected.
 
+    IndexerHealth:
+      type: object
+      description: >
+        Live indexer health: the stored cursor compared against the chain tip.
+        See §9. Unlike IndexerStatus, this calls RPC (through a short-lived
+        cache), and an unreachable RPC is reported as status "stalled", never
+        as a 5xx.
+      required:
+        - contract_id
+        - status
+        - reason
+        - detail
+        - degraded
+        - cursor_ledger
+        - rpc_latest_ledger
+        - lag_ledgers
+        - lag_seconds_estimate
+        - last_event_at
+        - retention_headroom
+        - checked_at
+      properties:
+        contract_id: { type: string }
+        status: { type: string, enum: [ok, lagging, stalled] }
+        reason:
+          $ref: '#/components/schemas/IndexerHealthReason'
+        detail:
+          type: string
+          description: >
+            Free-text, human-readable explanation of status and reason, with
+            the numbers that produced it. For people, not for parsing: switch
+            on `reason`. Never contains the RPC error text, which can carry
+            the RPC URL and any API key in it.
+        degraded:
+          type: boolean
+          description: >
+            A retention gap has been recorded (see IndexerStatus). Independent
+            of status: a caught-up indexer can still be degraded.
+        cursor_ledger:
+          type: [integer, 'null']
+          description: Last ledger scanned. Null if the vault was never indexed.
+        rpc_latest_ledger:
+          type: [integer, 'null']
+          description: Chain tip from RPC. Null when RPC is unreachable.
+        lag_ledgers:
+          type: [integer, 'null']
+          description: rpc_latest_ledger - cursor_ledger, floored at 0.
+        lag_seconds_estimate:
+          type: [integer, 'null']
+          description: lag_ledgers x 5s average ledger close time. An estimate.
+        last_event_at:
+          type: [string, 'null']
+          format: date-time
+          description: Close time of the newest indexed event. Null if none.
+        retention_headroom:
+          type: [integer, 'null']
+          description: >
+            Ledgers until the cursor falls outside the RPC event retention
+            window (120,960 - lag_ledgers, floored at 0). At 0, unread events
+            are aging out.
+        checked_at:
+          type: string
+          format: date-time
+          description: >
+            When this status was computed (RFC 3339, UTC). The chain tip it
+            was compared against comes from a cache and may be up to
+            VAULT_STATUS_RPC_CACHE_SECONDS older than this.
+
+    IndexerHealthReason:
+      type: string
+      description: >
+        Closed enum: why `status` has its value. Exactly one per status:
+        rpc_unreachable, never_indexed and no_recent_commit go with stalled;
+        lag_over_threshold goes with lagging; none goes with ok.
+      enum:
+        - rpc_unreachable     # chain-tip lookup failed or timed out
+        - never_indexed       # no indexer row, or no batch ever committed
+        - no_recent_commit    # last commit older than VAULT_STATUS_STALL_SECONDS
+        - lag_over_threshold  # lag_ledgers >= VAULT_STATUS_LAGGING_LEDGERS
+        - none                # status is ok
+
     VaultEvent:
       type: object
       required: [event_id, event_type, ledger, ledger_closed_at, tx_hash]
@@ -713,6 +793,23 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/IndexerStatus' }
 
+  /vault/{contract_id}/status:
+    get:
+      summary: Live indexer health against the chain tip
+      description: >
+        Compares the stored cursor with RPC's latest ledger (cached for a few
+        seconds). Always 200 for a configured vault: RPC being unreachable is
+        a health result (status stalled, reason rpc_unreachable), not a
+        server error.
+      parameters: [{ $ref: '#/components/parameters/ContractId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IndexerHealth' }
+        '404': { description: not this tenant's vault, or ENABLE_VAULT is off }
+
   /vault/{contract_id}/transactions:
     post:
       summary: Build an unsigned, simulated transaction envelope
@@ -834,6 +931,9 @@ not instance configuration.
 | `VAULT_CONTRACT_ID` | `--vault-contract-id` | *(empty)* | **Required when enabled**; startup fails fast otherwise |
 | `VAULT_INDEXER_INTERVAL_SECONDS` | `--vault-indexer-interval-seconds` | `10` | Validated against the existing minimum-interval floor |
 | `VAULT_INDEX_FROM_LEDGER` | `--vault-index-from-ledger` | `0` (auto) | Pin a bootstrap ledger |
+| `VAULT_STATUS_LAGGING_LEDGERS` | `--vault-status-lagging-ledgers` | `60` | Lag (ledgers) at or above which `GET /vault/{contract_id}/status` reports `lagging`. Must be `≥ 1` and below the 120,960-ledger RPC event retention window |
+| `VAULT_STATUS_STALL_SECONDS` | `--vault-status-stall-seconds` | `300` | Seconds without an indexer commit before `/status` reports `stalled`. Must be longer than `VAULT_INDEXER_INTERVAL_SECONDS` |
+| `VAULT_STATUS_RPC_CACHE_SECONDS` | `--vault-status-rpc-cache-seconds` | `5` | How long `/status` caches the RPC latest-ledger lookup (1–60). The reported chain tip may be up to this old |
 
 This follows the established `ENABLE_SEP45` / `ENABLE_EMBEDDED_WALLETS`
 pattern in `cmd/serve.go`: a `ConfigKey` wired into `serveOpts` and consumed
@@ -893,3 +993,203 @@ Mocks follow the existing `internal/stellar/mocks` generated-mock style, so
 - Vault deployment or `initialize` from SDP; vaults are deployed out-of-band
   and referenced by contract id.
 - Multiple tokens per vault — the contract is single-token by design.
+
+---
+
+## 9. Indexer health status
+
+`GET /vault/{contract_id}/status` reports whether the indexer is keeping up
+with the chain, from outside the indexer job.
+
+### 9.1 What already exists, and why this is not a duplicate
+
+| Existing piece | What it answers | Gap |
+|---|---|---|
+| `vault_indexer_state` | Stored cursor (`last_ledger`), `last_indexed_at`, gap bounds | No chain tip, so no lag |
+| `GET /vault/{id}/indexer` (also embedded as `indexer` in every list response) | Stored position and whether a gap was recorded (`healthy` / `degraded`) | Never calls RPC by design, so `lag_ledgers` is always `0` and `latest_ledger` echoes the cursor |
+| `vault.AssessLag` + `LagMonitor` | Lag against the retention window (`ok` / `warning` / `critical`) | Computed only inside the job, after a run. If the job stops running, it stops reporting |
+| `sdp_vault_indexer_lag_ledgers`, `sdp_vault_indexer_degraded` gauges | Same, as metrics | Needs a metrics backend, and goes silent rather than red when the job dies |
+
+None of these can say "the indexer has stopped". Every existing signal is
+produced *by* the job, so a dead job reads the same as a quiet, healthy one.
+`/status` measures from outside the job, comparing the stored cursor and
+commit time with the live chain tip.
+
+**It is a new route, not a change to `/indexer`.** The `/indexer` shape is
+embedded in every list response, and its `status` enum (`healthy` /
+`degraded`) is already used by the frontend. Changing it would add an RPC call
+to every dashboard page load (§4 deliberately avoids that) and would break the
+enum. `/indexer` stays as it is: cheap, database-only, and about gaps.
+`/status` is live and about progress. Its response includes `degraded`, so one
+call gives a monitor the whole picture.
+
+Code is reused, not copied: `stellar.EventRetentionWindowLedgers` for the
+window, the same `>=` boundary convention as `AssessLag`, and the RPC client
+`serve.go` already builds for the transaction builder.
+
+### 9.2 Endpoint
+
+`GET /vault/{contract_id}/status`, registered in the vault read group in
+`internal/serve/serve.go`:
+
+- **Auth:** the same `RequirePermission(data.ReadVault, AnyRoleMiddleware(owner,
+  financial_controller, business, initiator, approver))` as the other vault
+  reads, inside the authenticated router group. `/status` is a row in the
+  same serve-level route table as every other vault route, so it is held to
+  the same role matrix and API key checks.
+- **Tenant scoping:** the same `contractIDFromRequest` check, so another
+  contract returns 404, and the same tenant-routed `DBConnectionPool`, so the
+  cursor read is per-tenant by construction.
+- **Flag off:** not registered, so it returns 404, like every vault route.
+
+The schema is `IndexerHealth` in the §4 spec. Example:
+
+```json
+{
+  "contract_id": "CB5H...HG53",
+  "status": "lagging",
+  "reason": "lag_over_threshold",
+  "detail": "indexer is 120 ledgers behind the chain tip (threshold 60); 120840 ledgers of retention headroom remain",
+  "degraded": false,
+  "cursor_ledger": 812340,
+  "rpc_latest_ledger": 812460,
+  "lag_ledgers": 120,
+  "lag_seconds_estimate": 600,
+  "last_event_at": "2026-11-11T09:12:05Z",
+  "retention_headroom": 120840,
+  "checked_at": "2026-11-11T09:20:31.402Z"
+}
+```
+
+Fields:
+
+- `reason` is a **closed enum** (`IndexerHealthReason`): `rpc_unreachable`,
+  `never_indexed`, `no_recent_commit`, `lag_over_threshold`, `none`. It is never
+  null. Monitors switch on it.
+- `detail` is **free text** for people, with the numbers that produced the
+  result. It is not a stable format. It never contains the RPC error text,
+  because that can carry the RPC URL and any API key in it; the error is
+  logged at warn instead.
+- `checked_at` is when the status was computed (RFC 3339, UTC). **The chain
+  tip it is compared against can be up to `VAULT_STATUS_RPC_CACHE_SECONDS`
+  older than `checked_at`** (§9.5). So with the default 5s cache,
+  `rpc_latest_ledger` can trail the real tip by about one ledger, and
+  `lag_ledgers` can read low by the same amount.
+- `lag_ledgers = max(0, rpc_latest_ledger - cursor_ledger)`. A cursor ahead
+  of a cached tip means caught up, not negative lag.
+- `lag_seconds_estimate = lag_ledgers × stellar.AverageLedgerCloseSeconds`
+  (5s, the close time the retention window was measured at). It is an
+  estimate by design.
+- `retention_headroom = max(0, EventRetentionWindowLedgers - lag_ledgers)`.
+  It is derived from the window constant rather than an extra `getEvents`
+  probe for `oldestLedger`, so each cache refresh makes one RPC call, not
+  two. The existing lag alert makes the same assumption.
+- `last_event_at` comes from `VaultModel.GetLastEventAt`: `SELECT
+  ledger_closed_at … ORDER BY ledger DESC, id DESC LIMIT 1`, served by
+  `vault_events_contract_ledger_idx`. It is null when no event exists.
+- When RPC is unreachable, `rpc_latest_ledger`, `lag_ledgers`,
+  `lag_seconds_estimate` and `retention_headroom` are `null`, not `0`,
+  because a zero would read as "caught up". `cursor_ledger`, `last_event_at`
+  and `degraded` still come from the database. `cursor_ledger` is null only
+  when no indexer row exists.
+
+### 9.3 Status rules
+
+`vault.AssessHealth(input, thresholds, now)` is a pure function with no I/O
+and an injected clock. Rules are evaluated in order, and the first match wins:
+
+| # | Condition | `status` | `reason` |
+|---|---|---|---|
+| 1 | Chain-tip lookup failed or timed out | `stalled` | `rpc_unreachable` |
+| 2 | No `vault_indexer_state` row, or `last_indexed_at` is null | `stalled` | `never_indexed` |
+| 3 | `now - last_indexed_at >= VAULT_STATUS_STALL_SECONDS` | `stalled` | `no_recent_commit` |
+| 4 | `lag_ledgers >= VAULT_STATUS_LAGGING_LEDGERS` | `lagging` | `lag_over_threshold` |
+| 5 | otherwise | `ok` | `none` |
+
+Notes:
+
+- Both thresholds use `>=`, which matches `AssessLag`, so "at the threshold"
+  means the same thing everywhere in the vault code.
+- Rule 3 is sound because an idle run still commits.
+  `Test_Indexer_Run_idleRunsAdvanceLastIndexedAt` backdates `last_indexed_at`
+  by an hour, runs the indexer with no events (with and without the tip
+  moving), and asserts the timestamp jumps to now. The test fails if
+  `AdvanceCursor` stops setting `last_indexed_at`. The commit depends on RPC
+  returning a cursor for an empty page, which stellar-rpc always does.
+- A commit time in the future (database clock ahead) is not treated as
+  stalled.
+- `never_indexed` is `stalled`, not `ok`. That is the honest reading, and with
+  the default 10s interval it clears on the first run.
+- `degraded` does not change `status`. A gap is permanent history, not current
+  progress, and folding it in would leave a recovered indexer red forever.
+
+### 9.4 Configuration
+
+New `serve` options, following the existing `VAULT_*` `ConfigKey` pattern.
+They are listed in §6 and in the README. They are validated only when
+`ENABLE_VAULT` is true, and startup fails fast otherwise.
+
+| Variable | CLI flag | Default | Validation |
+|---|---|---|---|
+| `VAULT_STATUS_LAGGING_LEDGERS` | `--vault-status-lagging-ledgers` | `60` (~5 min) | `1 ≤ v < 120,960`. A threshold at or past the retention window could only fire after data is already lost |
+| `VAULT_STATUS_STALL_SECONDS` | `--vault-status-stall-seconds` | `300` | `v > VAULT_INDEXER_INTERVAL_SECONDS`, otherwise a healthy indexer would flap between runs |
+| `VAULT_STATUS_RPC_CACHE_SECONDS` | `--vault-status-rpc-cache-seconds` | `5` (~1 ledger) | `1 ≤ v ≤ 60` |
+
+Why these defaults: a healthy indexer on a 10s interval sits about 2 to 3
+ledgers behind the tip. 60 ledgers is about 30 runs' worth of falling behind,
+well clear of noise, and three orders of magnitude below the 60,480-ledger
+data-loss warning, so `lagging` fires days before the existing alert would.
+300s is about 30 consecutive runs with no commit.
+
+### 9.5 Caching the chain tip
+
+- A process-wide `vault.LatestLedgerCache` wraps `GetLatestLedgerSequence`.
+  The chain tip is public, network-wide data, so sharing one cache across
+  tenants exposes nothing tenant-specific. Tenant data (cursor, events) is
+  never cached.
+- The TTL is `VAULT_STATUS_RPC_CACHE_SECONDS`. That is the bound on how stale
+  `rpc_latest_ledger` can be relative to `checked_at`.
+- Concurrent misses are collapsed: the lock is held across the lookup, so N
+  simultaneous requests make one RPC call.
+- **Errors are cached for the same TTL.** During an outage, requests get an
+  immediate `stalled` instead of each waiting out its own timeout.
+- Each lookup has a **2s timeout** (`vault.DefaultLatestLedgerLookupTimeout`),
+  so a hung RPC becomes `rpc_unreachable` quickly. The lookup does not inherit
+  the triggering request's cancellation (`context.WithoutCancel`), so one
+  client disconnecting cannot cache a "context canceled" error for everyone
+  else.
+- **No stale fallback.** If the cached value has expired and the refresh fails,
+  the result is `stalled`. It never reuses an older tip, which could report
+  `ok` during an outage.
+
+### 9.6 Error handling
+
+| Failure | Response |
+|---|---|
+| RPC unreachable, erroring or hung | `200`, `stalled` / `rpc_unreachable`; the error is logged at warn, not returned |
+| Wrong or invalid contract id | `404` / `400`, as on the other vault routes |
+| Database read fails | `500`, as on the other vault routes. The service's own store failing is a server error, not an indexer health result |
+
+### 9.7 Tests
+
+| Area | Where |
+|---|---|
+| Idle runs advance `last_indexed_at` (the rule-3 precondition) | `internal/vault/indexer_test.go` |
+| Every status transition and threshold boundary (`-1` / `=` / `+1` for lag and commit age), rule precedence, derived fields and their floors, nulls when RPC is down, JSON shape | `internal/vault/status_test.go` |
+| Cache: hit within TTL, expiry at exactly TTL, cached errors, no stale fallback, hung RPC times out, caller cancellation does not poison the cache, concurrent misses make one call | `internal/vault/latest_ledger_cache_test.go` (fake RPC with answer / error / hang modes) |
+| `GetLastEventAt`: none, newest by ledger, scoped to the contract | `internal/data/vault_test.go` |
+| Handler: full shape, each status end-to-end, RPC error text never echoed, hung RPC through the real cache, contract scoping | `internal/serve/httphandler/vault_handler_test.go` |
+| Route: flag off gives 404, no token gives 401, every role, and API key permissions, in the same table as every other vault route | `internal/serve/serve_vault_routes_test.go` |
+| Env var bounds; the `/status` body through the real mux | `internal/serve/serve_vault_status_test.go` |
+
+A mutation check on the threshold logic in `AssessHealth` is run before each
+PR. Its results are recorded in the PR description rather than in the repo.
+
+### 9.8 Not in this change
+
+- `/indexer`'s `latest_ledger` / `lag_ledgers = 0` fields stay as they are.
+  They are documented as stored-position-only, and changing them would change
+  every list response.
+- Spec-conformance checks across all vault handlers (issue #10) and an
+  operator runbook (issue #11) are open contributor issues.
+- No new metric. The existing gauges already cover lag.

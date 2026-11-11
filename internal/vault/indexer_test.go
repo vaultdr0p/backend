@@ -330,6 +330,54 @@ func Test_Indexer_Run_advancesTheCursorOnAnIdleVault(t *testing.T) {
 	assert.Equal(t, data.VaultIndexerStatusHealthy, state.Status)
 }
 
+func Test_Indexer_Run_idleRunsAdvanceLastIndexedAt(t *testing.T) {
+	// GET /vault/{id}/status reports "stalled / no_recent_commit" when
+	// last_indexed_at is older than VAULT_STATUS_STALL_SECONDS. That rule is
+	// only sound if a run that reads *no* events still commits and moves the
+	// timestamp; otherwise every quiet vault would be reported as stalled.
+	testCases := []struct {
+		name       string
+		nextLatest uint32
+	}{
+		{name: "chain tip moved, no events", nextLatest: 1110},
+		{name: "chain tip unchanged, no events", nextLatest: 1100},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rpcClient := &fakeRPC{oldestLedger: 900, latestLedger: 1100}
+			ctx, models, indexer := newIndexerTest(t, rpcClient)
+
+			_, err := indexer.Run(ctx)
+			require.NoError(t, err)
+
+			// Backdate the timestamp so "advanced" cannot be confused with
+			// "set moments ago by the first run".
+			_, err = models.DBConnectionPool.ExecContext(ctx,
+				`UPDATE vault_indexer_state SET last_indexed_at = NOW() - INTERVAL '1 hour' WHERE contract_id = $1`,
+				vaultContractID)
+			require.NoError(t, err)
+			before, err := models.Vault.GetIndexerState(ctx, models.DBConnectionPool, vaultContractID)
+			require.NoError(t, err)
+			require.NotNil(t, before.LastIndexedAt)
+
+			rpcClient.latestLedger = tc.nextLatest
+			result, err := indexer.Run(ctx)
+			require.NoError(t, err)
+			require.Zero(t, result.EventsRead, "this test is about runs that read nothing")
+
+			after, err := models.Vault.GetIndexerState(ctx, models.DBConnectionPool, vaultContractID)
+			require.NoError(t, err)
+			require.NotNil(t, after.LastIndexedAt)
+			assert.True(t, after.LastIndexedAt.After(before.LastIndexedAt.Add(59*time.Minute)),
+				"an idle run must move last_indexed_at forward: before=%s after=%s",
+				before.LastIndexedAt, after.LastIndexedAt)
+			assert.WithinDuration(t, time.Now(), *after.LastIndexedAt, time.Minute)
+			assert.Equal(t, int32(tc.nextLatest), after.LastLedger)
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Idempotency and replay
 // ---------------------------------------------------------------------------

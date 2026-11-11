@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/stellar/stellar-disbursement-platform-backend/db"
 )
@@ -210,6 +211,24 @@ func (m VaultModel) ListEvents(ctx context.Context, sqlExec db.SQLExecuter, filt
 	}
 
 	return events, nil
+}
+
+// GetLastEventAt returns the close time of the vault's newest indexed event,
+// or nil when none has been indexed. It orders the same way as ListEvents, so
+// it is a single read from vault_events_contract_ledger_idx rather than a
+// MAX() over the whole history.
+func (m VaultModel) GetLastEventAt(ctx context.Context, sqlExec db.SQLExecuter, contractID string) (*time.Time, error) {
+	const query = `SELECT ledger_closed_at FROM vault_events WHERE contract_id = $1 ORDER BY ledger DESC, id DESC LIMIT 1`
+
+	var closedAt time.Time
+	if err := sqlExec.GetContext(ctx, &closedAt, query, contractID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("getting the last vault event time: %w", err)
+	}
+
+	return &closedAt, nil
 }
 
 // CountPages converts a total and a page request into a page count, which the

@@ -1,6 +1,7 @@
 package httphandler
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/support/http/httpdecode"
+	"github.com/stellar/go-stellar-sdk/support/log"
 	"github.com/stellar/go-stellar-sdk/support/render/httpjson"
 
 	"github.com/stellar/stellar-disbursement-platform-backend/internal/data"
@@ -41,6 +43,18 @@ type VaultHandler struct {
 	// TransactionBuilder builds unsigned envelopes. Nil when the vault is
 	// enabled without RPC, which startup validation rejects.
 	TransactionBuilder *vault.TransactionBuilder
+	// LatestLedger supplies the chain tip for GET /status, normally a
+	// *vault.LatestLedgerCache. Nil is treated as RPC being unreachable.
+	LatestLedger LatestLedgerReader
+	// HealthThresholds are the lagging / stalled limits for GET /status.
+	HealthThresholds vault.HealthThresholds
+	// Now is the clock for GET /status. Nil means time.Now.
+	Now func() time.Time
+}
+
+// LatestLedgerReader is the chain-tip lookup GET /status depends on.
+type LatestLedgerReader interface {
+	Get(ctx context.Context) (uint32, error)
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +481,70 @@ func (h VaultHandler) GetVaultIndexer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpjson.Render(w, indexer, httpjson.JSON)
+}
+
+// ---------------------------------------------------------------------------
+// GET /vault/{contract_id}/status
+// ---------------------------------------------------------------------------
+
+// errNoLatestLedgerSource stands in for a lookup when no source is wired.
+var errNoLatestLedgerSource = errors.New("no latest-ledger source is configured")
+
+// GetVaultStatus serves live indexer health: the stored cursor and commit
+// time against the chain tip. See docs/VAULT_DESIGN.md §9.
+//
+// Unlike /indexer this consults RPC, through a short-lived cache. RPC being
+// unreachable is a *result* — 200 with status "stalled" — not a server
+// error: a monitor polling this endpoint needs an answer precisely when
+// things are broken. A failing database read is still a 500, as on every
+// other vault route, because then this service itself is unhealthy.
+func (h VaultHandler) GetVaultStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	contractID, httpErr := h.contractIDFromRequest(r)
+	if httpErr != nil {
+		httpErr.Render(w)
+		return
+	}
+
+	state, err := h.Models.Vault.GetIndexerState(ctx, h.Models.DBConnectionPool, contractID)
+	if errors.Is(err, data.ErrRecordNotFound) {
+		state, err = nil, nil
+	}
+	if err != nil {
+		httperror.InternalError(ctx, "Cannot read vault indexer state", err, nil).Render(w)
+		return
+	}
+
+	lastEventAt, err := h.Models.Vault.GetLastEventAt(ctx, h.Models.DBConnectionPool, contractID)
+	if err != nil {
+		httperror.InternalError(ctx, "Cannot read vault events", err, nil).Render(w)
+		return
+	}
+
+	var latest uint32
+	latestErr := errNoLatestLedgerSource
+	if h.LatestLedger != nil {
+		latest, latestErr = h.LatestLedger.Get(ctx)
+	}
+	if latestErr != nil {
+		// Logged, not returned: the error text can carry the RPC URL, which
+		// may embed a provider API key.
+		log.Ctx(ctx).Warnf("vault %s status: chain-tip lookup failed: %v", contractID, latestErr)
+	}
+
+	now := time.Now
+	if h.Now != nil {
+		now = h.Now
+	}
+
+	httpjson.Render(w, vault.AssessHealth(vault.HealthInput{
+		ContractID:      contractID,
+		State:           state,
+		LatestLedger:    latest,
+		LatestLedgerErr: latestErr,
+		LastEventAt:     lastEventAt,
+	}, h.HealthThresholds, now()), httpjson.JSON)
 }
 
 // ---------------------------------------------------------------------------

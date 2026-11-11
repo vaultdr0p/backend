@@ -166,3 +166,8 @@ const EventRetentionWindowLedgers uint32 = 120_960
 // retention window, leaving roughly 3.5 days to intervene before events start
 // aging out unread.
 const EventRetentionLagWarnLedgers uint32 = EventRetentionWindowLedgers / 2
+
+// AverageLedgerCloseSeconds is the average ledger close time the retention
+// window above was measured at (5.00s). It turns a ledger count into a time
+// estimate; it is an average, so anything derived from it is an estimate too.
+const AverageLedgerCloseSeconds uint32 = 5

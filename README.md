@@ -36,7 +36,7 @@ claims recorded on-chain are visible through the SDP's own API.
 |---|---|
 | **Event indexer** | A multi-tenant scheduled job, `vault_event_indexer_job`, that reads the contract's events from Soroban RPC and projects them into each tenant's schema. Idempotent on the RPC event id, with cursor advancement and event inserts in a single database transaction |
 | **Vault tables** | Four tables added by `db/migrations/sdp-migrations/2026-11-02.0-add-vault-tables.sql`: `vault_indexer_state`, `vault_events`, `vault_allocations` and `vault_state` |
-| **HTTP endpoints** | Seven routes under `/vault/{contract_id}` — five reads, plus `POST /transactions` to build an unsigned, simulated envelope and `POST /resync` to rewind the indexer cursor. Gated by the new `read:vault` and `write:vault` permissions |
+| **HTTP endpoints** | Eight routes under `/vault/{contract_id}` — six reads, plus `POST /transactions` to build an unsigned, simulated envelope and `POST /resync` to rewind the indexer cursor. Gated by the new `read:vault` and `write:vault` permissions |
 | **Lag and gap monitoring** | The `sdp_vault_indexer_lag_ledgers` and `sdp_vault_indexer_degraded` metrics, with alert thresholds derived from the measured RPC event-retention window |
 
 **It is off by default.** With `ENABLE_VAULT` unset, the routes are not
@@ -509,6 +509,9 @@ a claim is authorised by the recipient, not the admin.
 | `VAULT_CONTRACT_ID` | `--vault-contract-id` | *(empty)* | **Required when enabled**; startup fails fast otherwise. A public contract address, not a secret |
 | `VAULT_INDEXER_INTERVAL_SECONDS` | `--vault-indexer-interval-seconds` | `10` | Validated against the minimum job interval |
 | `VAULT_INDEX_FROM_LEDGER` | `--vault-index-from-ledger` | `0` (auto) | Pin a bootstrap ledger. `0` starts at the oldest ledger RPC still serves events for |
+| `VAULT_STATUS_LAGGING_LEDGERS` | `--vault-status-lagging-ledgers` | `60` | Lag (ledgers) at or above which `GET /vault/{contract_id}/status` reports `lagging`. Must be `≥ 1` and below the 120,960-ledger RPC event retention window |
+| `VAULT_STATUS_STALL_SECONDS` | `--vault-status-stall-seconds` | `300` | Seconds without an indexer commit before `/status` reports `stalled`. Must be longer than `VAULT_INDEXER_INTERVAL_SECONDS` |
+| `VAULT_STATUS_RPC_CACHE_SECONDS` | `--vault-status-rpc-cache-seconds` | `5` | How long `/status` caches the RPC latest-ledger lookup (1–60). The reported chain tip may be up to this old |
 
 Enabling the vault requires `RPC_URL`, since the indexer and the transaction
 builder both need Stellar RPC. RPC credentials reuse the existing
@@ -537,6 +540,7 @@ which exceed both `int64` and IEEE-754 double precision, so parse them with
 | `GET` | `/vault/{contract_id}/allocations/{recipient}` | *same* | One recipient's allocation |
 | `GET` | `/vault/{contract_id}/events` | *same* | Indexed event history, newest first. Filters: `event_type`, `address`. Paginated |
 | `GET` | `/vault/{contract_id}/indexer` | *same* | Indexer health on its own |
+| `GET` | `/vault/{contract_id}/status` | *same* | Live indexer status against the chain tip: `ok` / `lagging` / `stalled` with a `reason`, lag, retention headroom and `checked_at`. RPC being down is reported as `stalled`, not a 5xx |
 | `POST` | `/vault/{contract_id}/transactions` | owner, financial_controller | Build an unsigned, simulated envelope for `fund`, `register`, `cancel` or `withdraw` |
 | `POST` | `/vault/{contract_id}/resync` | owner | Rewind the indexer cursor and replay |
 
