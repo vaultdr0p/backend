@@ -201,13 +201,71 @@ func Test_AssessHealth_jsonShape(t *testing.T) {
 	for _, key := range []string{
 		"contract_id", "status", "reason", "detail", "degraded", "cursor_ledger",
 		"rpc_latest_ledger", "lag_ledgers", "lag_seconds_estimate", "last_event_at",
-		"retention_headroom", "checked_at",
+		"retention_headroom", "checked_at", "summary",
 	} {
 		assert.Contains(t, body, key)
 	}
-	assert.Len(t, body, 12, "no undocumented keys")
+	assert.Len(t, body, 13, "no undocumented keys")
+	assert.Equal(t, map[string]any{
+		"state":            "missing",
+		"bootstrap_ledger": nil,
+		"bootstrap":        map[string]any{"attempts": float64(0), "last_error": nil, "next_attempt_at": nil},
+	}, body["summary"], "summary keys are always present, null rather than omitted")
 	assert.Equal(t, "stalled", body["status"])
 	assert.Equal(t, "rpc_unreachable", body["reason"])
 	assert.Nil(t, body["lag_ledgers"])
 	assert.Equal(t, "2026-11-11T12:00:00Z", body["checked_at"], "checked_at is normalised to UTC RFC 3339")
+}
+
+func Test_AssessHealth_summary(t *testing.T) {
+	ledger := int32(1105)
+	lastError := "rpc_unreachable"
+	next := healthNow.Add(20 * time.Second)
+
+	testCases := []struct {
+		name string
+		in   HealthInput
+		want HealthSummary
+	}{
+		{
+			name: "no summary row, no attempts yet",
+			in:   HealthInput{State: &data.VaultIndexerState{}},
+			want: HealthSummary{State: SummaryStateMissing},
+		},
+		{
+			name: "no summary row, snapshot failing",
+			in: HealthInput{State: &data.VaultIndexerState{
+				SnapshotAttempts: 2, SnapshotLastError: &lastError, SnapshotNextAttemptAt: &next,
+			}},
+			want: HealthSummary{State: SummaryStateMissing, Bootstrap: SummaryBootstrap{
+				Attempts: 2, LastError: &lastError, NextAttemptAt: &next,
+			}},
+		},
+		{
+			name: "event-derived summary",
+			in:   HealthInput{State: &data.VaultIndexerState{}, Summary: &data.VaultState{Source: data.VaultStateSourceEvents}},
+			want: HealthSummary{State: SummaryStateEvents},
+		},
+		{
+			name: "snapshot summary",
+			in: HealthInput{State: &data.VaultIndexerState{}, Summary: &data.VaultState{
+				Source: data.VaultStateSourceSnapshot, BootstrapLedger: &ledger,
+			}},
+			want: HealthSummary{State: SummaryStateSnapshot, BootstrapLedger: &ledger},
+		},
+		{
+			name: "no indexer row at all",
+			in:   HealthInput{},
+			want: HealthSummary{State: SummaryStateMissing},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.in.ContractID = vaultContractID
+			tc.in.LatestLedger = 10
+			got := AssessHealth(tc.in, healthThresholds, healthNow)
+			assert.Equal(t, tc.want, got.Summary)
+		})
+	}
 }

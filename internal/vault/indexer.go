@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/support/log"
 
@@ -39,10 +40,13 @@ const (
 
 // RPCClient is the slice of internal/stellar.RPCClient the indexer uses.
 // Declaring it here rather than taking the full interface keeps the indexer's
-// mock small and makes its RPC surface explicit: two reads, no writes.
+// mock small and makes its RPC surface explicit: three reads, no writes.
+// SimulateTransaction is used only to read contract state for a summary
+// snapshot (snapshot.go); nothing is ever submitted.
 type RPCClient interface {
 	GetEvents(ctx context.Context, request protocol.GetEventsRequest) (*protocol.GetEventsResponse, error)
 	GetLatestLedgerSequence(ctx context.Context) (uint32, error)
+	SnapshotRPCClient
 }
 
 // Indexer reads a vault contract's events into the current tenant's schema.
@@ -57,6 +61,8 @@ type Indexer struct {
 	contractID      string
 	indexFromLedger uint32
 	batchLimit      uint
+	// now is the clock for the snapshot backoff. Tests replace it.
+	now func() time.Time
 }
 
 // NewIndexer builds an indexer for one vault contract.
@@ -77,6 +83,7 @@ func NewIndexer(rpcClient RPCClient, models *data.Models, contractID string, ind
 		contractID:      contractID,
 		indexFromLedger: indexFromLedger,
 		batchLimit:      defaultBatchLimit,
+		now:             time.Now,
 	}, nil
 }
 
@@ -100,7 +107,31 @@ type Result struct {
 	LatestLedger uint32
 	// Degraded is true when this vault has a known, unrecoverable gap.
 	Degraded bool
+	// SummaryUpdatesMissed counts, per event type, events whose vault_state
+	// update found no summary row to apply to. The update is a no-op either
+	// way; this makes it visible (logged and exported as a counter).
+	SummaryUpdatesMissed map[EventType]int
+	// Snapshot is what the summary snapshot step did this run.
+	Snapshot SnapshotOutcome
 }
+
+// SnapshotOutcome is what one run's summary snapshot step did.
+type SnapshotOutcome string
+
+const (
+	// SnapshotNotNeeded: a summary row exists, or the run did not reach the
+	// chain tip (an `initialized` event might still be ahead).
+	SnapshotNotNeeded SnapshotOutcome = ""
+	// SnapshotDeferred: needed, but the backoff has not elapsed.
+	SnapshotDeferred SnapshotOutcome = "deferred"
+	// SnapshotTaken: the summary was created from contract state.
+	SnapshotTaken SnapshotOutcome = "taken"
+	// SnapshotDiscarded: read successfully, but a row appeared meanwhile, so
+	// the snapshot was not written.
+	SnapshotDiscarded SnapshotOutcome = "discarded"
+	// SnapshotFailed: the read failed; the failure is recorded for backoff.
+	SnapshotFailed SnapshotOutcome = "failed"
+)
 
 // LagLedgers is how far behind the chain tip indexing is. This is the value
 // the lag metric and its alert are built on.
@@ -145,12 +176,17 @@ func (idx *Indexer) Run(ctx context.Context) (*Result, error) {
 		Degraded:     state.Status == data.VaultIndexerStatusDegraded,
 	}
 
+	// reachedTip is true only when RPC had nothing more to return. A run that
+	// stopped at maxBatchesPerRun has not scanned the whole window, so an
+	// `initialized` event may still be ahead and a snapshot would be premature.
+	reachedTip := false
 	for batch := 0; batch < maxBatchesPerRun; batch++ {
-		applied, err := idx.runBatch(ctx, state, &result)
+		more, err := idx.runBatch(ctx, state, &result)
 		if err != nil {
 			return nil, err
 		}
-		if !applied {
+		if !more {
+			reachedTip = true
 			break
 		}
 
@@ -164,7 +200,118 @@ func (idx *Indexer) Run(ctx context.Context) (*Result, error) {
 		result.LastLedger = state.LastLedger
 	}
 
+	if reachedTip {
+		if err := idx.snapshotIfMissing(ctx, window, &result); err != nil {
+			return nil, err
+		}
+	}
+
 	return &result, nil
+}
+
+// snapshotIfMissing creates the vault summary from contract state when the
+// whole retention window has been scanned and no `initialized` event created
+// it (docs/VAULT_DESIGN.md §10).
+//
+// An RPC failure here never fails the run: the event batches already
+// committed stay committed, the failure is recorded as a category with a
+// backoff, and /status reports it. Only a database failure is returned.
+func (idx *Indexer) snapshotIfMissing(ctx context.Context, window ledgerWindow, result *Result) error {
+	pool := idx.models.DBConnectionPool
+
+	_, err := idx.models.Vault.GetState(ctx, pool, idx.contractID)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, data.ErrRecordNotFound) {
+		return fmt.Errorf("checking for a vault summary: %w", err)
+	}
+
+	state, err := idx.models.Vault.GetIndexerState(ctx, pool, idx.contractID)
+	if err != nil {
+		return fmt.Errorf("reading the snapshot backoff: %w", err)
+	}
+	now := idx.now()
+	if state.SnapshotNextAttemptAt != nil && now.Before(*state.SnapshotNextAttemptAt) {
+		result.Snapshot = SnapshotDeferred
+		return nil
+	}
+
+	snapshot, err := ReadContractSnapshot(ctx, idx.rpcClient, idx.contractID)
+	if err != nil {
+		category := data.SnapshotErrorSimulationFailed
+		var snapErr *SnapshotError
+		if errors.As(err, &snapErr) {
+			category = snapErr.Category
+		}
+		next := now.Add(SnapshotBackoff(state.SnapshotAttempts + 1))
+		// The full error is logged, not stored: it can carry the RPC URL.
+		log.Ctx(ctx).Warnf("vault %s: summary snapshot failed (%s), next attempt at %s: %v",
+			idx.contractID, category, next.UTC().Format(time.RFC3339), err)
+		if recErr := idx.models.Vault.RecordSnapshotFailure(ctx, pool, idx.contractID, category, next); recErr != nil {
+			return fmt.Errorf("recording the snapshot failure: %w", recErr)
+		}
+		result.Snapshot = SnapshotFailed
+		return nil
+	}
+
+	// Where the unindexed history ends: the ledger before the first one this
+	// deployment scanned. Older rows did not record that ledger, so the
+	// current retention floor stands in, and the reason says so.
+	firstIndexed := int32(window.Oldest)
+	approximate := true
+	if state.StartLedger != nil {
+		firstIndexed, approximate = *state.StartLedger, false
+	}
+	gapTo := firstIndexed - 1
+	reason := fmt.Sprintf(
+		"the vault was created before ledger %d, the first ledger this deployment indexed, so its summary "+
+			"was read from contract state at ledger %d. Recipients registered before ledger %d are not listed: "+
+			"the contract cannot enumerate them. Balances and totals come from the contract.",
+		firstIndexed, snapshot.Ledger, firstIndexed)
+	if approximate {
+		reason += fmt.Sprintf(" The first indexed ledger was not recorded for this vault; ledger %d is the RPC "+
+			"retention floor when the snapshot was taken, an upper bound.", firstIndexed)
+	}
+
+	inserted := false
+	err = db.RunInTransaction(ctx, pool, nil, func(dbTx db.DBTransaction) error {
+		var txErr error
+		inserted, txErr = idx.models.Vault.InsertSnapshotState(ctx, dbTx, data.VaultState{
+			ContractID:     idx.contractID,
+			AdminAddress:   snapshot.Admin,
+			TokenAddress:   snapshot.Token,
+			Deadline:       snapshot.Deadline,
+			TotalAllocated: snapshot.TotalAllocated,
+			TotalClaimed:   snapshot.TotalClaimed,
+			Balance:        snapshot.Balance,
+			SnapshotLedger: int32(snapshot.Ledger),
+		})
+		if txErr != nil {
+			return fmt.Errorf("inserting the snapshot: %w", txErr)
+		}
+		if !inserted {
+			return nil
+		}
+		if markErr := idx.models.Vault.MarkSnapshotBootstrapped(ctx, dbTx, idx.contractID, gapTo, reason); markErr != nil {
+			return fmt.Errorf("marking the vault degraded after the snapshot: %w", markErr)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("writing the vault snapshot: %w", err)
+	}
+
+	if !inserted {
+		result.Snapshot = SnapshotDiscarded
+		return nil
+	}
+
+	log.Ctx(ctx).Warnf("vault %s: summary bootstrapped from contract state at ledger %d; marked degraded: %s",
+		idx.contractID, snapshot.Ledger, reason)
+	result.Snapshot = SnapshotTaken
+	result.Degraded = true
+	return nil
 }
 
 // describeWindow asks RPC which ledgers it can still serve events for.
@@ -295,8 +442,11 @@ func (idx *Indexer) bootstrap(ctx context.Context, window ledgerWindow) (*data.V
 	}
 
 	// last_ledger is the last ledger *scanned*, so it starts one below the
-	// first ledger to read.
+	// first ledger to read. start_ledger is kept so a later summary snapshot
+	// can say exactly where the unindexed history ends.
 	state.LastLedger = int32(startFrom) - 1
+	start := int32(startFrom)
+	state.StartLedger = &start
 
 	bootstrapped, err := idx.models.Vault.BootstrapIndexerState(ctx, idx.models.DBConnectionPool, state)
 	if err != nil {
@@ -469,9 +619,11 @@ func (idx *Indexer) project(ctx context.Context, dbTx db.DBTransaction, event *E
 		if event.Deadline == nil {
 			return errors.New("initialized event has no deadline")
 		}
-		// Seeds the snapshot. Totals start at zero because initialize runs
+		// Seeds the summary. Totals start at zero because initialize runs
 		// before any fund or register, so there is nothing yet to carry over.
-		if err := vaultModel.UpsertState(ctx, dbTx, data.VaultState{
+		// Insert-only: an existing row (a snapshot, then a resync replaying
+		// this event) is always newer and must not be reset to zero.
+		if _, err := vaultModel.SeedStateFromEvent(ctx, dbTx, data.VaultState{
 			ContractID:     event.ContractID,
 			AdminAddress:   event.Address,
 			TokenAddress:   event.Token,
@@ -488,9 +640,11 @@ func (idx *Indexer) project(ctx context.Context, dbTx db.DBTransaction, event *E
 		}
 		// funded publishes the resulting balance, so this is an absolute set
 		// rather than a delta.
-		if err := vaultModel.ApplyFundedBalance(ctx, dbTx, event.ContractID, *event.Balance, event.Ledger); err != nil {
+		update, err := vaultModel.ApplyFundedBalance(ctx, dbTx, event.ContractID, *event.Balance, event.Ledger)
+		if err != nil {
 			return fmt.Errorf("applying the funded balance: %w", err)
 		}
+		idx.noteStateUpdate(ctx, event, update, result)
 		return nil
 
 	case EventTypeRegistered:
@@ -507,41 +661,65 @@ func (idx *Indexer) project(ctx context.Context, dbTx db.DBTransaction, event *E
 		}); err != nil {
 			return fmt.Errorf("registering the allocation: %w", err)
 		}
-		if err := vaultModel.ApplyTotalAllocated(ctx, dbTx, event.ContractID, *event.TotalAllocated, event.Ledger); err != nil {
+		update, err := vaultModel.ApplyTotalAllocated(ctx, dbTx, event.ContractID, *event.TotalAllocated, event.Ledger)
+		if err != nil {
 			return fmt.Errorf("applying the registered total: %w", err)
 		}
+		idx.noteStateUpdate(ctx, event, update, result)
 		return nil
 
 	case EventTypeClaimed:
 		if err := idx.settle(ctx, dbTx, event, data.VaultAllocationStatusClaimed, result); err != nil {
 			return err
 		}
-		if err := vaultModel.ApplyClaim(ctx, dbTx, event.ContractID, *event.Amount, event.Ledger); err != nil {
+		update, err := vaultModel.ApplyClaim(ctx, dbTx, event.ContractID, *event.Amount, event.Ledger)
+		if err != nil {
 			return fmt.Errorf("applying the claim: %w", err)
 		}
+		idx.noteStateUpdate(ctx, event, update, result)
 		return nil
 
 	case EventTypeCancelled:
 		if err := idx.settle(ctx, dbTx, event, data.VaultAllocationStatusCancelled, result); err != nil {
 			return err
 		}
-		if err := vaultModel.ApplyCancellation(ctx, dbTx, event.ContractID, *event.Amount, event.Ledger); err != nil {
+		update, err := vaultModel.ApplyCancellation(ctx, dbTx, event.ContractID, *event.Amount, event.Ledger)
+		if err != nil {
 			return fmt.Errorf("applying the cancellation: %w", err)
 		}
+		idx.noteStateUpdate(ctx, event, update, result)
 		return nil
 
 	case EventTypeWithdrawn:
 		if event.Amount == nil {
 			return errors.New("withdrawn event has no amount")
 		}
-		if err := vaultModel.ApplyWithdrawal(ctx, dbTx, event.ContractID, *event.Amount, event.Ledger); err != nil {
+		update, err := vaultModel.ApplyWithdrawal(ctx, dbTx, event.ContractID, *event.Amount, event.Ledger)
+		if err != nil {
 			return fmt.Errorf("applying the withdrawal: %w", err)
 		}
+		idx.noteStateUpdate(ctx, event, update, result)
 		return nil
 
 	default:
 		return fmt.Errorf("%q: %w", event.Type, ErrUnknownEventType)
 	}
+}
+
+// noteStateUpdate logs and counts an event whose vault_state update found no
+// summary row. The update itself is unchanged — it is a no-op either way — but
+// a silent no-op is how a vault whose `initialized` event was never indexed
+// went unnoticed: every later event updated nothing.
+func (idx *Indexer) noteStateUpdate(ctx context.Context, event *Event, update data.StateUpdate, result *Result) {
+	if update.RowExists {
+		return
+	}
+	log.Ctx(ctx).Warnf("vault %s: %s event %s found no vault summary row to update; the summary is missing",
+		idx.contractID, event.Type, event.EventID)
+	if result.SummaryUpdatesMissed == nil {
+		result.SummaryUpdatesMissed = map[EventType]int{}
+	}
+	result.SummaryUpdatesMissed[event.Type]++
 }
 
 // settle moves an allocation to a terminal state, tolerating a missing row.

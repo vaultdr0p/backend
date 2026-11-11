@@ -550,7 +550,20 @@ API keys additionally need the `read:vault` or `write:vault` permission
 Every list response carries an `indexer` object alongside `data` and
 `pagination`, so a dashboard can show a staleness or degraded banner without a
 second request. A contract id that is not the tenant's configured vault
-returns **404**, as does every route when `ENABLE_VAULT` is off.
+returns **404** with `"error_code": "vault_not_found"`; a vault with no summary
+yet returns **404** with `"error_code": "vault_not_indexed"`. The `error`
+message is unchanged in both. With `ENABLE_VAULT` off, every route is
+unregistered and returns the router's plain-text 404.
+
+**Vaults created before indexing began.** If the vault's `initialized` event is
+older than the RPC retention window (about 7 days), the indexer reads the
+summary (admin, token, deadline, totals, balance) from contract state by
+read-only simulation, once it has scanned the whole window. The overview then
+reports `"source": "snapshot"` and the `bootstrap_ledger` it was read at, and
+the indexer is marked **degraded**: recipients registered before indexing began
+cannot be listed, because the contract cannot enumerate them. `/status`
+reports this, and any retry backoff, in its `summary` object. Design:
+[`docs/VAULT_DESIGN.md`](docs/VAULT_DESIGN.md) §10.
 
 A simulation failure is returned as **400** carrying the contract's own typed
 error, so an operation the contract would reject is reported before the user is
@@ -565,12 +578,14 @@ asked to sign:
 
 ### Monitoring the indexer
 
-Two gauges are exported, labelled by `tenant_name` and `contract_id`:
+Two gauges and one counter are exported, labelled by `tenant_name` and
+`contract_id` (the counter also by `event_type`):
 
 | Metric | Meaning |
 |---|---|
 | `sdp_vault_indexer_lag_ledgers` | Ledgers between the chain tip and the last ledger indexed |
 | `sdp_vault_indexer_degraded` | `1` when the vault has a known, unrecoverable gap in its event history |
+| `sdp_vault_indexer_summary_update_missed_total` | Events whose summary update found no summary row. Non-zero means the overview is missing for that vault |
 
 **Alert on lag.** Soroban RPC retains contract events for a bounded window —
 measured against `soroban-testnet.stellar.org` as **120,960 ledgers**

@@ -192,6 +192,20 @@ func Test_VaultSchema_IndexerStateGapConstraint(t *testing.T) {
 			wantError: true,
 		},
 		{
+			// A summary snapshot cannot know the contract's creation ledger.
+			name: "🟢 degraded with an unknown gap start",
+			query: `INSERT INTO vault_indexer_state
+				(contract_id, last_cursor, last_ledger, status, gap_to_ledger, degraded_reason)
+				VALUES ('C_ok3', '0-0', 10, 'degraded', 20, 'created before indexing began')`,
+		},
+		{
+			name: "🔴 degraded with a gap start but no gap end",
+			query: `INSERT INTO vault_indexer_state
+				(contract_id, last_cursor, last_ledger, status, gap_from_ledger, degraded_reason)
+				VALUES ('C_bad5', '0-0', 10, 'degraded', 10, 'x')`,
+			wantError: true,
+		},
+		{
 			name: "🔴 unknown status is rejected",
 			query: `INSERT INTO vault_indexer_state (contract_id, last_cursor, last_ledger, status)
 				VALUES ('C_bad4', '0-0', 10, 'stalled')`,
@@ -277,4 +291,38 @@ func Test_VaultSchema_EventTypeConstraint(t *testing.T) {
 			 VALUES ('bad-1', 'C1', 'upgraded', 1, NOW(), 'abc', '{}')`)
 		assert.Error(t, err)
 	})
+}
+
+func Test_VaultSchema_StateSourceConstraint(t *testing.T) {
+	dbt := dbtest.Open(t)
+	defer dbt.Close()
+
+	ctx := context.Background()
+	dbConnectionPool, err := db.OpenDBConnectionPool(dbt.DSN)
+	require.NoError(t, err)
+	defer dbConnectionPool.Close()
+
+	const columns = `(contract_id, admin_address, token_address, deadline, snapshot_ledger, source, bootstrap_ledger)`
+	testCases := []struct {
+		name      string
+		values    string
+		wantError bool
+	}{
+		{name: "🟢 events without a bootstrap ledger", values: `('C_s1', 'G', 'C', NOW(), 1, 'events', NULL)`},
+		{name: "🟢 snapshot with a bootstrap ledger", values: `('C_s2', 'G', 'C', NOW(), 1, 'snapshot', 1)`},
+		{name: "🔴 snapshot without a bootstrap ledger", values: `('C_s3', 'G', 'C', NOW(), 1, 'snapshot', NULL)`, wantError: true},
+		{name: "🔴 events with a bootstrap ledger", values: `('C_s4', 'G', 'C', NOW(), 1, 'events', 1)`, wantError: true},
+		{name: "🔴 unknown source", values: `('C_s5', 'G', 'C', NOW(), 1, 'guess', NULL)`, wantError: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := dbConnectionPool.ExecContext(ctx, `INSERT INTO vault_state `+columns+` VALUES `+tc.values)
+			if tc.wantError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
 }

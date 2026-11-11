@@ -86,19 +86,30 @@ type IndexerStatusResponse struct {
 
 // VaultOverviewResponse is the vault's cached snapshot plus indexer health.
 type VaultOverviewResponse struct {
-	ContractID     string                `json:"contract_id"`
-	Admin          string                `json:"admin"`
-	Token          string                `json:"token"`
-	Deadline       time.Time             `json:"deadline"`
-	IsExpired      bool                  `json:"is_expired"`
-	TotalAllocated data.VaultAmount      `json:"total_allocated"`
-	TotalClaimed   data.VaultAmount      `json:"total_claimed"`
-	Balance        data.VaultAmount      `json:"balance"`
-	Available      data.VaultAmount      `json:"available"`
-	SnapshotLedger int32                 `json:"snapshot_ledger"`
-	RefreshedAt    time.Time             `json:"refreshed_at"`
-	Indexer        IndexerStatusResponse `json:"indexer"`
+	ContractID     string           `json:"contract_id"`
+	Admin          string           `json:"admin"`
+	Token          string           `json:"token"`
+	Deadline       time.Time        `json:"deadline"`
+	IsExpired      bool             `json:"is_expired"`
+	TotalAllocated data.VaultAmount `json:"total_allocated"`
+	TotalClaimed   data.VaultAmount `json:"total_claimed"`
+	Balance        data.VaultAmount `json:"balance"`
+	Available      data.VaultAmount `json:"available"`
+	SnapshotLedger int32            `json:"snapshot_ledger"`
+	RefreshedAt    time.Time        `json:"refreshed_at"`
+	// Source is "events" or "snapshot"; BootstrapLedger is the ledger a
+	// snapshot was read at, and null for an event-derived summary.
+	Source          data.VaultStateSource `json:"source"`
+	BootstrapLedger *int32                `json:"bootstrap_ledger"`
+	Indexer         IndexerStatusResponse `json:"indexer"`
 }
+
+// Stable machine-readable codes on the vault 404s, alongside the unchanged
+// human-readable messages (docs/VAULT_DESIGN.md §10.7).
+const (
+	errorCodeVaultNotFound   = "vault_not_found"
+	errorCodeVaultNotIndexed = "vault_not_indexed"
+)
 
 // VaultPaginationResponse matches the spec's pagination object.
 type VaultPaginationResponse struct {
@@ -140,7 +151,7 @@ func (h VaultHandler) contractIDFromRequest(r *http.Request) (string, *httperror
 		})
 	}
 	if contractID != h.ContractID {
-		return "", httperror.NotFound("Vault not found.", nil, nil)
+		return "", httperror.NotFound("Vault not found.", nil, nil).WithErrorCode(errorCodeVaultNotFound)
 	}
 
 	return contractID, nil
@@ -258,7 +269,7 @@ func (h VaultHandler) GetVault(w http.ResponseWriter, r *http.Request) {
 		// indexed yet, so there is nothing to show. 404 is honest here; an
 		// empty overview with zeroed amounts would read as a real, empty
 		// vault.
-		httperror.NotFound("Vault has not been indexed yet.", err, nil).Render(w)
+		httperror.NotFound("Vault has not been indexed yet.", err, nil).WithErrorCode(errorCodeVaultNotIndexed).Render(w)
 		return
 	}
 	if err != nil {
@@ -273,18 +284,20 @@ func (h VaultHandler) GetVault(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpjson.Render(w, VaultOverviewResponse{
-		ContractID:     state.ContractID,
-		Admin:          state.AdminAddress,
-		Token:          state.TokenAddress,
-		Deadline:       state.Deadline,
-		IsExpired:      state.IsExpired(time.Now()),
-		TotalAllocated: state.TotalAllocated,
-		TotalClaimed:   state.TotalClaimed,
-		Balance:        state.Balance,
-		Available:      state.Available(),
-		SnapshotLedger: state.SnapshotLedger,
-		RefreshedAt:    state.RefreshedAt,
-		Indexer:        indexer,
+		ContractID:      state.ContractID,
+		Admin:           state.AdminAddress,
+		Token:           state.TokenAddress,
+		Deadline:        state.Deadline,
+		IsExpired:       state.IsExpired(time.Now()),
+		TotalAllocated:  state.TotalAllocated,
+		TotalClaimed:    state.TotalClaimed,
+		Balance:         state.Balance,
+		Available:       state.Available(),
+		SnapshotLedger:  state.SnapshotLedger,
+		RefreshedAt:     state.RefreshedAt,
+		Source:          state.Source,
+		BootstrapLedger: state.BootstrapLedger,
+		Indexer:         indexer,
 	}, httpjson.JSON)
 }
 
@@ -522,6 +535,15 @@ func (h VaultHandler) GetVaultStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	summary, err := h.Models.Vault.GetState(ctx, h.Models.DBConnectionPool, contractID)
+	if errors.Is(err, data.ErrRecordNotFound) {
+		summary, err = nil, nil
+	}
+	if err != nil {
+		httperror.InternalError(ctx, "Cannot read vault state", err, nil).Render(w)
+		return
+	}
+
 	var latest uint32
 	latestErr := errNoLatestLedgerSource
 	if h.LatestLedger != nil {
@@ -544,6 +566,7 @@ func (h VaultHandler) GetVaultStatus(w http.ResponseWriter, r *http.Request) {
 		LatestLedger:    latest,
 		LatestLedgerErr: latestErr,
 		LastEventAt:     lastEventAt,
+		Summary:         summary,
 	}, h.HealthThresholds, now()), httpjson.JSON)
 }
 
@@ -597,7 +620,8 @@ func (h VaultHandler) ResyncVault(w http.ResponseWriter, r *http.Request) {
 
 	err := h.Models.Vault.AdvanceCursor(ctx, h.Models.DBConnectionPool, contractID, "", resumeAfter)
 	if errors.Is(err, data.ErrRecordNotFound) {
-		httperror.NotFound("Vault has not been indexed yet, so there is nothing to resync.", err, nil).Render(w)
+		httperror.NotFound("Vault has not been indexed yet, so there is nothing to resync.", err, nil).
+			WithErrorCode(errorCodeVaultNotIndexed).Render(w)
 		return
 	}
 	if err != nil {
@@ -684,7 +708,8 @@ func (h VaultHandler) renderBuildError(w http.ResponseWriter, r *http.Request, c
 	}
 
 	if errors.Is(err, data.ErrRecordNotFound) {
-		httperror.NotFound("Vault has not been indexed yet, so a transaction cannot be built for it.", err, nil).Render(w)
+		httperror.NotFound("Vault has not been indexed yet, so a transaction cannot be built for it.", err, nil).
+			WithErrorCode(errorCodeVaultNotIndexed).Render(w)
 		return
 	}
 

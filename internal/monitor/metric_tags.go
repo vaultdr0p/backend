@@ -33,6 +33,9 @@ const (
 	// built on — see internal/vault.LagAlert.
 	VaultIndexerLagLedgersTag MetricTag = "indexer_lag_ledgers"
 	VaultIndexerDegradedTag   MetricTag = "indexer_degraded"
+	// VaultIndexerSummaryUpdateMissedTag counts events whose vault_state
+	// update found no summary row (docs/VAULT_DESIGN.md §10).
+	VaultIndexerSummaryUpdateMissedTag MetricTag = "indexer_summary_update_missed_total"
 )
 
 func (m MetricTag) ListAll() []MetricTag {
@@ -56,5 +59,6 @@ func (m MetricTag) ListAll() []MetricTag {
 
 		VaultIndexerLagLedgersTag,
 		VaultIndexerDegradedTag,
+		VaultIndexerSummaryUpdateMissedTag,
 	}
 }

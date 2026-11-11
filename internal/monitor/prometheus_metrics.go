@@ -83,6 +83,13 @@ var HistogramVecMetrics = map[MetricTag]*prometheus.HistogramVec{
 }
 
 var CounterVecMetrics = map[MetricTag]*prometheus.CounterVec{
+	VaultIndexerSummaryUpdateMissedTag: prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: DefaultNamespace, Subsystem: string(VaultSubservice), Name: string(VaultIndexerSummaryUpdateMissedTag),
+		Help: "Vault events whose summary (vault_state) update found no row to apply to. Non-zero means the " +
+			"vault's summary is missing, typically because its initialized event was never indexed.",
+	},
+		VaultEventLabelNames,
+	),
 	DisbursementsCounterTag: prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: DefaultNamespace, Subsystem: string(BusinessSubservice), Name: string(DisbursementsCounterTag),
 		Help: "Disbursements Counter",
@@ -101,6 +108,9 @@ var CounterVecMetrics = map[MetricTag]*prometheus.CounterVec{
 // contract_id is included because a tenant may run more than one vault, and a
 // single degraded vault must be identifiable rather than averaged away.
 var VaultLabelNames = []string{"tenant_name", "contract_id"}
+
+// VaultEventLabelNames adds the event type, for per-event vault counters.
+var VaultEventLabelNames = []string{"tenant_name", "contract_id", "event_type"}
 
 var GaugeVecMetrics = map[MetricTag]*prometheus.GaugeVec{
 	VaultIndexerLagLedgersTag: prometheus.NewGaugeVec(prometheus.GaugeOpts{

@@ -60,6 +60,35 @@ type HealthInput struct {
 	LatestLedgerErr error
 	// LastEventAt is the close time of the newest indexed event, nil if none.
 	LastEventAt *time.Time
+	// Summary is the vault's summary row, nil when there is none.
+	Summary *data.VaultState
+}
+
+// SummaryState says whether the vault has a summary, and where it came from.
+type SummaryState string
+
+const (
+	SummaryStateMissing  SummaryState = "missing"
+	SummaryStateEvents   SummaryState = "events"
+	SummaryStateSnapshot SummaryState = "snapshot"
+)
+
+// HealthSummary reports the vault summary behind GET /vault/{contract_id}
+// (docs/VAULT_DESIGN.md §10.6). It is separate from Status and Reason, which
+// are about indexing progress and keep their closed enum.
+type HealthSummary struct {
+	State SummaryState `json:"state"`
+	// BootstrapLedger is the ledger a snapshot was read at; nil otherwise.
+	BootstrapLedger *int32           `json:"bootstrap_ledger"`
+	Bootstrap       SummaryBootstrap `json:"bootstrap"`
+}
+
+// SummaryBootstrap is the snapshot retry state. LastError is a category, never
+// raw RPC text.
+type SummaryBootstrap struct {
+	Attempts      int        `json:"attempts"`
+	LastError     *string    `json:"last_error"`
+	NextAttemptAt *time.Time `json:"next_attempt_at"`
 }
 
 // Health is the response body of GET /vault/{contract_id}/status.
@@ -67,18 +96,19 @@ type HealthInput struct {
 // Fields that depend on RPC are pointers so an unreachable RPC renders them as
 // null. A zero would read as "caught up", which is the opposite of the truth.
 type Health struct {
-	ContractID         string       `json:"contract_id"`
-	Status             HealthStatus `json:"status"`
-	Reason             HealthReason `json:"reason"`
-	Detail             string       `json:"detail"`
-	Degraded           bool         `json:"degraded"`
-	CursorLedger       *int32       `json:"cursor_ledger"`
-	RPCLatestLedger    *uint32      `json:"rpc_latest_ledger"`
-	LagLedgers         *uint32      `json:"lag_ledgers"`
-	LagSecondsEstimate *uint64      `json:"lag_seconds_estimate"`
-	LastEventAt        *time.Time   `json:"last_event_at"`
-	RetentionHeadroom  *uint32      `json:"retention_headroom"`
-	CheckedAt          time.Time    `json:"checked_at"`
+	ContractID         string        `json:"contract_id"`
+	Status             HealthStatus  `json:"status"`
+	Reason             HealthReason  `json:"reason"`
+	Detail             string        `json:"detail"`
+	Degraded           bool          `json:"degraded"`
+	CursorLedger       *int32        `json:"cursor_ledger"`
+	RPCLatestLedger    *uint32       `json:"rpc_latest_ledger"`
+	LagLedgers         *uint32       `json:"lag_ledgers"`
+	LagSecondsEstimate *uint64       `json:"lag_seconds_estimate"`
+	LastEventAt        *time.Time    `json:"last_event_at"`
+	RetentionHeadroom  *uint32       `json:"retention_headroom"`
+	CheckedAt          time.Time     `json:"checked_at"`
+	Summary            HealthSummary `json:"summary"`
 }
 
 // AssessHealth classifies indexer health. Rules are evaluated in order and
@@ -99,6 +129,8 @@ func AssessHealth(in HealthInput, th HealthThresholds, now time.Time) Health {
 		LastEventAt: in.LastEventAt,
 		CheckedAt:   now.UTC(),
 	}
+
+	h.Summary = assessSummary(in)
 
 	if in.State != nil {
 		cursor := in.State.LastLedger
@@ -152,6 +184,30 @@ func AssessHealth(in HealthInput, th HealthThresholds, now time.Time) Health {
 	}
 
 	return h
+}
+
+// assessSummary reports whether the vault has a summary row and, if not, how
+// the snapshot that would create one is getting on.
+func assessSummary(in HealthInput) HealthSummary {
+	summary := HealthSummary{State: SummaryStateMissing}
+
+	if in.Summary != nil {
+		summary.State = SummaryStateEvents
+		if in.Summary.Source == data.VaultStateSourceSnapshot {
+			summary.State = SummaryStateSnapshot
+			summary.BootstrapLedger = in.Summary.BootstrapLedger
+		}
+	}
+
+	if in.State != nil {
+		summary.Bootstrap = SummaryBootstrap{
+			Attempts:      in.State.SnapshotAttempts,
+			LastError:     in.State.SnapshotLastError,
+			NextAttemptAt: in.State.SnapshotNextAttemptAt,
+		}
+	}
+
+	return summary
 }
 
 // lagBetween is how far the cursor trails the tip, floored at zero. A cursor

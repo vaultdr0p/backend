@@ -234,6 +234,9 @@ On first run for a contract, with no cursor:
 `VAULT_INDEX_FROM_LEDGER` may be set to pin an explicit start ledger when an
 operator knows the deployment ledger.
 
+> The "seed `vault_state` from the contract by simulation" step above was not
+> implemented in the first version. §10 specifies it.
+
 ### 2.8 Job wiring
 
 A scheduler job, following the existing `internal/scheduler/jobs` convention:
@@ -500,6 +503,18 @@ components:
           description: balance - total_allocated; the most that can be withdrawn.
         snapshot_ledger: { type: integer }
         refreshed_at: { type: string, format: date-time }
+        source:
+          type: string
+          enum: [events, snapshot]
+          description: >
+            How this summary was created (§10). "events": seeded by the
+            contract's initialized event. "snapshot": read from contract state
+            because initialized was older than the RPC retention window; the
+            indexer is then also marked degraded, because recipients registered
+            before indexing began are not listed.
+        bootstrap_ledger:
+          type: [integer, 'null']
+          description: The ledger a snapshot was read at. Null for source "events".
         indexer: { $ref: '#/components/schemas/IndexerStatus' }
 
     IndexerStatus:
@@ -513,7 +528,12 @@ components:
           type: integer
           description: latest_ledger - last_ledger.
         last_indexed_at: { type: [string, 'null'], format: date-time }
-        gap_from_ledger: { type: [integer, 'null'] }
+        gap_from_ledger:
+          type: [integer, 'null']
+          description: >
+            Null while healthy. Null while degraded means the gap's start is
+            unknown: the summary was read from contract state and the
+            contract's creation ledger cannot be read from RPC (§10.5).
         gap_to_ledger: { type: [integer, 'null'] }
         degraded_reason:
           type: [string, 'null']
@@ -542,6 +562,7 @@ components:
         - last_event_at
         - retention_headroom
         - checked_at
+        - summary
       properties:
         contract_id: { type: string }
         status: { type: string, enum: [ok, lagging, stalled] }
@@ -588,6 +609,32 @@ components:
             When this status was computed (RFC 3339, UTC). The chain tip it
             was compared against comes from a cache and may be up to
             VAULT_STATUS_RPC_CACHE_SECONDS older than this.
+        summary: { $ref: '#/components/schemas/VaultSummaryHealth' }
+
+    VaultSummaryHealth:
+      type: object
+      description: >
+        The summary behind GET /vault/{contract_id} (§10.6). Reported
+        separately from status and reason, whose enums are unchanged.
+      required: [state, bootstrap_ledger, bootstrap]
+      properties:
+        state: { type: string, enum: [missing, events, snapshot] }
+        bootstrap_ledger:
+          type: [integer, 'null']
+          description: The ledger a snapshot was read at; null otherwise.
+        bootstrap:
+          type: object
+          required: [attempts, last_error, next_attempt_at]
+          properties:
+            attempts:
+              type: integer
+              description: Consecutive failed snapshot attempts. 0 after a success.
+            last_error:
+              type: [string, 'null']
+              enum: [rpc_unreachable, contract_not_initialized, inconsistent_ledgers,
+                     simulation_failed, invalid_response, null]
+              description: A category, never raw RPC error text.
+            next_attempt_at: { type: [string, 'null'], format: date-time }
 
     IndexerHealthReason:
       type: string
@@ -659,7 +706,23 @@ components:
       required: [error]
       properties:
         error: { type: string }
+        error_code: { type: string }
         extras: { type: object, additionalProperties: true }
+
+    VaultError:
+      description: >
+        A vault 404 with a stable, machine-readable code next to the unchanged
+        human-readable message (§10.7). vault_not_found: the contract is not
+        this tenant's vault (every vault route). vault_not_indexed: the vault
+        has no summary or indexer row yet (overview, resync, transactions).
+        Not used when ENABLE_VAULT is off: the routes are then unregistered
+        and the router answers a plain-text "404 page not found".
+      allOf:
+        - { $ref: '#/components/schemas/Problem' }
+        - type: object
+          required: [error_code]
+          properties:
+            error_code: { type: string, enum: [vault_not_found, vault_not_indexed] }
 
   parameters:
     ContractId:
@@ -699,7 +762,15 @@ paths:
               schema: { $ref: '#/components/schemas/VaultOverview' }
         '401': { description: missing or invalid token }
         '403': { description: role lacks read permission }
-        '404': { description: vault not configured for this tenant, or flag off }
+        '404':
+          description: >
+            Not this tenant's vault (error_code vault_not_found), or no summary
+            yet (vault_not_indexed; with snapshot bootstrap this lasts only
+            until the first full indexer run, see summary on /status). With the
+            flag off, a plain-text router 404 instead.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VaultError' }
 
   /vault/{contract_id}/allocations:
     get:
@@ -808,7 +879,13 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/IndexerHealth' }
-        '404': { description: not this tenant's vault, or ENABLE_VAULT is off }
+        '404':
+          description: >
+            Not this tenant's vault (error_code vault_not_found). With
+            ENABLE_VAULT off, a plain-text router 404 instead.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VaultError' }
 
   /vault/{contract_id}/transactions:
     post:
@@ -1193,3 +1270,206 @@ PR. Its results are recorded in the PR description rather than in the repo.
 - Spec-conformance checks across all vault handlers (issue #10) and an
   operator runbook (issue #11) are open contributor issues.
 - No new metric. The existing gauges already cover lag.
+
+---
+
+## 10. Summary bootstrap from contract state
+
+### 10.1 The problem
+
+`vault_state`, the summary behind `GET /vault/{contract_id}`, is created in
+exactly one place: the projection of the contract's `initialized` event
+(`UpsertState` in `Indexer.project`). Every later event only `UPDATE`s that row,
+so an event that finds no row is silently a no-op.
+
+On first sight of a vault the indexer starts at the oldest ledger RPC still
+serves (§2.7, about 7 days back). If the vault was created before that,
+`initialized` is never read: there is no summary row, the overview answers
+`404 "Vault has not been indexed yet."` for good, and every `funded`,
+`registered`, `claimed`, `cancelled` and `withdrawn` event updates nothing. Any
+deployment that starts indexing more than a week after the contract was
+created fails this way. The live testnet vault is in exactly this state.
+
+§2.6 and §2.7 already said to "seed `vault_state` from the contract by
+simulation". That was never implemented. This section specifies it and
+supersedes those two sentences.
+
+### 10.2 What the contract exposes, and what it does not
+
+Read-only functions (`bindings/disbursement-vault`, `contracts/disbursement-vault/src/lib.rs`):
+
+| Function | Returns | Summary field |
+|---|---|---|
+| `get_admin()` | `Result<Address>` | `admin_address` |
+| `get_token()` | `Result<Address>` | `token_address` |
+| `get_deadline()` | `Result<u64>` (unix seconds) | `deadline` |
+| `total_allocated()` | `i128` | `total_allocated` |
+| `total_claimed()` | `i128` | `total_claimed` |
+| `available()` | `Result<i128>` | (derived, not stored) |
+| `get_allocation(recipient)` | `Option<Allocation>` | (needs a known address) |
+
+There is no `balance()` on the vault. The balance is the token's own SEP-41
+`balance(id)` for the vault's address, read from the token contract.
+
+**Recipients cannot be enumerated.** `DataKey::Allocation(Address)` is a lookup
+by address, with no index or count (contract issue #8). So **the summary can be
+bootstrapped, but per-recipient allocations cannot.** They stay event-derived,
+and anyone registered before the first indexed ledger is unknown to SDP.
+Bootstrap does not change that. It makes the gap visible instead of hiding it
+(§10.5).
+
+### 10.3 How it is read
+
+The reads use `simulateTransaction` on the six view functions above (five on
+the vault, plus `balance(vault)` on the token), through the existing
+`stellar.RPCClient.SimulateTransaction`. Nothing is signed or submitted. The
+source account is a fixed public placeholder, the all-zero ed25519 key
+(`GAAAA…AWHF`), since read-only simulation does not load it. There is no secret
+key for it anywhere, and none is needed.
+
+Simulation is preferred over `getLedgerEntries`, which would read the
+contract's instance storage and the token's balance entry directly. That would
+be one atomic read, but it ties the backend to two private storage layouts. The
+second one is a SAC detail that a non-SAC token would not share. Simulation
+uses only public interfaces.
+
+The cost is that six simulations are six reads. To keep them consistent, every
+response must report **the same `latestLedger`**; that ledger is the snapshot
+ledger. If it moves between calls, the whole set is re-read (at most 3 times
+per attempt). If it still moves, the attempt fails like any other failure
+(§10.6). A mixed-ledger snapshot is never stored.
+
+### 10.4 When it runs, and the race with event indexing
+
+At the end of `Indexer.Run`, the snapshot is taken **only if all three hold**:
+
+1. there is no `vault_state` row, and
+2. the run stopped because RPC had nothing more to return, not because it hit
+   `maxBatchesPerRun`. Then the whole window up to the tip has been scanned,
+   and no `initialized` event in it created the row, and
+3. the backoff (§10.6) allows another attempt.
+
+An `initialized` event inside the window therefore always wins, through the
+normal event path.
+
+Correctness rules. Snapshot ledger = `L`.
+
+| Rule | How |
+|---|---|
+| Idempotent; never overwrites | `INSERT … ON CONFLICT (contract_id) DO NOTHING`. If an event created the row first, the snapshot is discarded |
+| Events at or before `L` are not applied twice | The snapshot already includes them. A new immutable column `bootstrap_ledger = L`. Every `vault_state` update in `ApplyFundedBalance`, `ApplyTotalAllocated`, `ApplyClaim`, `ApplyCancellation` and `ApplyWithdrawal` gains `AND (bootstrap_ledger IS NULL OR $ledger > bootstrap_ledger)`. Strictly greater: simulation reads state *after* ledger `L` closed |
+| A late `initialized` event cannot reset a snapshot | Its projection becomes insert-if-absent (`ON CONFLICT DO NOTHING`). `initialize` runs once per contract, so an existing row is always newer |
+| Allocation rows are unaffected by the guard | `RegisterAllocation` and `SettleAllocation` still apply for every new event, at any ledger: events are the only source of recipients |
+| No partial rows | All six values are decoded and validated, in memory and with the ledger check, before the single `INSERT`. Any failure means no write |
+| Nothing invented | Every column comes from a contract read. If `get_admin` and the others fail with the contract's `NotInitialized`, no row is written and the failure is reported. No zeroed or default summary is ever written |
+
+### 10.5 Marking the source, and being honest about allocations
+
+The migration adds to `vault_state`:
+
+- `source TEXT NOT NULL DEFAULT 'events' CHECK (source IN ('events','snapshot'))`
+- `bootstrap_ledger INTEGER NULL`: the ledger the snapshot was read at, and
+  `NULL` for event-derived rows. `snapshot_ledger` keeps its meaning: the
+  ledger the row is current to
+
+The overview gains two additive fields: `source` and `bootstrap_ledger`.
+
+When a snapshot is taken, history before the window is known to be missing,
+so the vault is **marked degraded** with reason "summary read from contract
+state at ledger L; events before ledger X were never indexed, so recipients
+registered before then are not listed (the contract cannot enumerate them)".
+Today such a vault is reported `healthy`, which is wrong.
+
+`X` is the first ledger the indexer scanned. That was not stored before, so
+`vault_indexer_state.start_ledger` now records it at bootstrap. For rows
+bootstrapped earlier it is `NULL`, and the RPC retention floor at the time of
+the snapshot stands in. That is an upper bound, and the degraded reason says so.
+
+The existing gap constraint requires both bounds while degraded, but the
+**start** of this gap (the contract's creation ledger) is not knowable from RPC.
+**Decided:** `vault_indexer_state_gap_check` now lets `gap_from_ledger` be
+`NULL` (meaning unknown) while degraded; `gap_to_ledger` is still required.
+A later retention gap keeps the unknown start, and only moves the end forward.
+
+The migration is reversible. On the way down, an unknown start becomes `0`,
+which is a superset of the true gap, because the old constraint requires a
+value. Snapshot rows stay, since they hold real contract values; only the
+provenance columns are dropped.
+
+### 10.6 Failure handling
+
+- **Never crashes the indexer.** A snapshot failure is logged and recorded. The
+  event batches already committed in that run stay committed, and `Run`
+  returns normally.
+- **Backoff, persisted.** The job builds a new `Indexer` on every tick, so the
+  backoff lives in the database. The migration adds columns to
+  `vault_indexer_state`: `snapshot_attempts`, `snapshot_next_attempt_at` and
+  `snapshot_last_error`. The delay is 10 s, 20 s, 40 s and so on, capped at
+  5 minutes; a success clears it. Only a category is stored, never raw RPC
+  error text, which can carry a provider URL or key (as in §9.6). The schema
+  enforces this with a check constraint on the five categories:
+  `rpc_unreachable`, `contract_not_initialized`, `inconsistent_ledgers`,
+  `simulation_failed` and `invalid_response`.
+- **Silent no-ops are now visible.** When an event's summary update finds no
+  row, the update itself is unchanged (still a no-op). The indexer logs a
+  warning naming the contract and the event type, and increments
+  `sdp_vault_indexer_summary_update_missed_total{tenant_name,contract_id,event_type}`.
+- **Reported through `GET /vault/{contract_id}/status`**, as an additive
+  `summary` object. The closed `reason` enum is unchanged, because the frontend
+  validates it strictly:
+  ```json
+  "summary": {
+    "state": "missing | snapshot | events",
+    "bootstrap_ledger": 123 | null,
+    "bootstrap": {
+      "attempts": 3,
+      "last_error": "rpc_unreachable" | null,
+      "next_attempt_at": "RFC 3339" | null
+    }
+  }
+  ```
+
+### 10.7 Machine-readable 404s (additive)
+
+SDP's `HTTPError` already has an `error_code` JSON field (`WithErrorCode`).
+Messages stay exactly as they are; only the code is added:
+
+| Where | Message (unchanged) | `error_code` |
+|---|---|---|
+| `contractIDFromRequest`: not this tenant's vault (every vault route) | `Vault not found.` | `vault_not_found` |
+| `GetVault`: no summary row | `Vault has not been indexed yet.` | `vault_not_indexed` |
+| `ResyncVault` / `BuildVaultTransaction`: no indexer state or summary row | `Vault has not been indexed yet, so …` | `vault_not_indexed` |
+
+The plain-text router 404 when `ENABLE_VAULT` is off is unchanged; the
+frontend relies on it for feature detection.
+
+OpenAPI: add a `VaultError` schema
+`{ error: string, error_code?: enum [vault_not_found, vault_not_indexed] }`.
+Give the vault routes' `404` responses a JSON body using it, and document the
+plain-text 404 for the flag-off case. Also add `source` and `bootstrap_ledger`
+to `VaultOverview`, and `summary` to the status response.
+
+### 10.8 Tests
+
+| Area | Cases |
+|---|---|
+| Snapshot reader (fake RPC) | success; RPC unreachable; one of six calls fails (no row); contract `NotInitialized` (no row, no zeros); `latestLedger` differs between calls, then retried until consistent; differs on every try (no row); undecodable value |
+| Race with events (real test DB) | an `initialized` event in the window means no snapshot; snapshot at `L`, then events at `L-1`, `L` and `L+1` replayed (only `L+1` touches `vault_state`, and allocation rows are written for all three); a snapshot after an event-created row is a no-op; a late `initialized` does not reset a snapshot; a run capped at `maxBatchesPerRun` does not snapshot |
+| Backoff | delay sequence and cap; no attempt before `next_attempt_at`; success clears it; the stored error is a category, never raw text |
+| Degraded marking | a snapshot marks degraded with `gap_from` `NULL` and `gap_to` = window floor − 1; the relaxed constraint still rejects a degraded row with no `gap_to` |
+| Handlers | `error_code` on each 404; the overview's `source` and `bootstrap_ledger`; `/status` `summary` in each state |
+
+A mutation check on the guards and the trigger conditions is run before the PR
+and recorded in its description.
+
+### 10.9 Not in this change
+
+- **Recovering the missing recipients.** That needs contract issue #8 or
+  operator input.
+- **The documented-but-unimplemented `?refresh=true`** on the overview. It is a
+  spec/handler mismatch (issue #10).
+- **A bounded re-scan command** (issue #7), which cannot help here anyway: the
+  missing events are outside retention.
+- **Frontend changes.** It will show the summary as soon as the overview
+  returns `200`. Its empty-allocation text is a known follow-up for degraded
+  vaults.
