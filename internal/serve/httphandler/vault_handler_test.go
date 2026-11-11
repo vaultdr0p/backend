@@ -195,7 +195,54 @@ func Test_VaultHandler_GetVault_notIndexedYet(t *testing.T) {
 	recorder := doRequest(t, router, http.MethodGet, "/vault/"+testVaultContract, "")
 
 	assert.Equal(t, http.StatusNotFound, recorder.Code)
-	assert.Contains(t, recorder.Body.String(), "not been indexed")
+	assertVaultError(t, recorder, "Vault has not been indexed yet.", "vault_not_indexed")
+}
+
+// assertVaultError checks a vault 404 body: the message is unchanged and the
+// machine-readable code is added alongside it.
+func assertVaultError(t *testing.T, recorder *httptest.ResponseRecorder, wantMessage, wantCode string) {
+	t.Helper()
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body), recorder.Body.String())
+	assert.Equal(t, wantMessage, body["error"])
+	assert.Equal(t, wantCode, body["error_code"])
+}
+
+func Test_VaultHandler_GetVault_reportsTheSummarySource(t *testing.T) {
+	t.Run("event-derived", func(t *testing.T) {
+		ctx, models, router := newVaultHandlerTest(t)
+		seedVault(t, ctx, models, time.Now().Add(time.Hour))
+
+		recorder := doRequest(t, router, http.MethodGet, "/vault/"+testVaultContract, "")
+		require.Equal(t, http.StatusOK, recorder.Code)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &raw))
+		assert.Equal(t, "events", raw["source"])
+		assert.Contains(t, raw, "bootstrap_ledger")
+		assert.Nil(t, raw["bootstrap_ledger"])
+	})
+
+	t.Run("snapshot", func(t *testing.T) {
+		ctx, models, router := newVaultHandlerTest(t)
+		_, err := models.Vault.BootstrapIndexerState(ctx, models.DBConnectionPool, data.VaultIndexerState{
+			ContractID: testVaultContract, LastLedger: 1000, Status: data.VaultIndexerStatusHealthy,
+		})
+		require.NoError(t, err)
+		_, err = models.Vault.InsertSnapshotState(ctx, models.DBConnectionPool, data.VaultState{
+			ContractID: testVaultContract, AdminAddress: testVaultAdminKey, TokenAddress: testVaultToken,
+			Deadline: time.Now().Add(time.Hour).UTC(), Balance: data.NewVaultAmount(7), SnapshotLedger: 1234,
+		})
+		require.NoError(t, err)
+
+		recorder := doRequest(t, router, http.MethodGet, "/vault/"+testVaultContract, "")
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		var response VaultOverviewResponse
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+		assert.Equal(t, data.VaultStateSourceSnapshot, response.Source)
+		require.NotNil(t, response.BootstrapLedger)
+		assert.Equal(t, int32(1234), *response.BootstrapLedger)
+		assert.Equal(t, "7", response.Balance.String())
+	})
 }
 
 func Test_VaultHandler_contractIDValidation(t *testing.T) {
@@ -246,6 +293,36 @@ func Test_VaultHandler_contractIDValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_VaultHandler_vaultNotFoundCarriesItsCodeOnEveryRoute(t *testing.T) {
+	ctx, models, router := newVaultHandlerTest(t)
+	seedVault(t, ctx, models, time.Now().Add(time.Hour))
+
+	for _, route := range []struct{ method, path, body string }{
+		{http.MethodGet, "", ""},
+		{http.MethodGet, "/allocations", ""},
+		{http.MethodGet, "/events", ""},
+		{http.MethodGet, "/indexer", ""},
+		{http.MethodPost, "/resync", `{"from_ledger":1}`},
+	} {
+		t.Run(route.method+" "+route.path, func(t *testing.T) {
+			recorder := doRequest(t, router, route.method, "/vault/"+otherContract+route.path, route.body)
+			require.Equal(t, http.StatusNotFound, recorder.Code)
+			assertVaultError(t, recorder, "Vault not found.", "vault_not_found")
+		})
+	}
+}
+
+func Test_VaultHandler_buildNotIndexedCarriesItsCode(t *testing.T) {
+	handler := VaultHandler{ContractID: testVaultContract}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/vault/"+testVaultContract+"/transactions", nil)
+
+	handler.renderBuildError(recorder, request, testVaultContract, fmt.Errorf("reading state: %w", data.ErrRecordNotFound))
+
+	require.Equal(t, http.StatusNotFound, recorder.Code)
+	assertVaultError(t, recorder, "Vault has not been indexed yet, so a transaction cannot be built for it.", "vault_not_indexed")
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +642,7 @@ func Test_VaultHandler_ResyncVault_notIndexedYet(t *testing.T) {
 		"/vault/"+testVaultContract+"/resync", `{"from_ledger":500}`)
 
 	assert.Equal(t, http.StatusNotFound, recorder.Code)
+	assertVaultError(t, recorder, "Vault has not been indexed yet, so there is nothing to resync.", "vault_not_indexed")
 }
 
 // ---------------------------------------------------------------------------
@@ -704,7 +782,47 @@ func Test_VaultHandler_GetVaultStatus_ok(t *testing.T) {
 	assert.EqualValues(t, 120_950, body["retention_headroom"])
 	assert.Equal(t, "2026-11-11T09:00:00Z", body["last_event_at"])
 	assert.Equal(t, now.Format(time.RFC3339Nano), body["checked_at"])
-	assert.Len(t, body, 12)
+	assert.Equal(t, map[string]any{
+		"state": "missing", "bootstrap_ledger": nil,
+		"bootstrap": map[string]any{"attempts": float64(0), "last_error": nil, "next_attempt_at": nil},
+	}, body["summary"])
+	assert.Len(t, body, 13)
+}
+
+func Test_VaultHandler_GetVaultStatus_summary(t *testing.T) {
+	t.Run("a snapshot summary reports its ledger", func(t *testing.T) {
+		ctx, models, router := newVaultStatusTest(t, fakeTipReader{ledger: 1010}, time.Now().UTC())
+		seedIndexedVault(t, ctx, models)
+		_, err := models.Vault.InsertSnapshotState(ctx, models.DBConnectionPool, data.VaultState{
+			ContractID: testVaultContract, AdminAddress: testVaultAdminKey, TokenAddress: testVaultToken,
+			Deadline: time.Now().Add(time.Hour).UTC(), SnapshotLedger: 1005,
+		})
+		require.NoError(t, err)
+
+		code, body := getStatus(t, router)
+		require.Equal(t, http.StatusOK, code)
+		summary := body["summary"].(map[string]any)
+		assert.Equal(t, "snapshot", summary["state"])
+		assert.EqualValues(t, 1005, summary["bootstrap_ledger"])
+	})
+
+	t.Run("a failing snapshot reports its category and next attempt, never raw text", func(t *testing.T) {
+		ctx, models, router := newVaultStatusTest(t, fakeTipReader{ledger: 1010}, time.Now().UTC())
+		seedIndexedVault(t, ctx, models)
+		next := time.Date(2026, 11, 11, 12, 0, 20, 0, time.UTC)
+		require.NoError(t, models.Vault.RecordSnapshotFailure(ctx, models.DBConnectionPool, testVaultContract,
+			data.SnapshotErrorRPCUnreachable, next))
+
+		code, body := getStatus(t, router)
+		require.Equal(t, http.StatusOK, code)
+		summary := body["summary"].(map[string]any)
+		assert.Equal(t, "missing", summary["state"])
+		assert.Equal(t, map[string]any{
+			"attempts": float64(1), "last_error": "rpc_unreachable", "next_attempt_at": "2026-11-11T12:00:20Z",
+		}, summary["bootstrap"])
+		// The reason enum is unchanged: summary state is reported separately.
+		assert.Equal(t, "ok", body["status"])
+	})
 }
 
 func Test_VaultHandler_GetVaultStatus_transitions(t *testing.T) {

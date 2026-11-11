@@ -43,6 +43,12 @@ type fakeRPC struct {
 	// requests records every GetEvents request, so tests can assert on what
 	// was actually asked for — the filter, the cursor, the format.
 	requests []protocol.GetEventsRequest
+
+	// contract is the state SimulateTransaction reads (snapshot_test.go).
+	// Nil makes every simulation fail as if RPC were unreachable.
+	contract *fakeContract
+	// simulations records every simulated read.
+	simulations []simulatedCall
 }
 
 func (f *fakeRPC) GetLatestLedgerSequence(context.Context) (uint32, error) {

@@ -34,6 +34,7 @@ type vaultEventIndexerJob struct {
 	contractID         string
 	indexFromLedger    uint32
 	lagMonitor         *vault.LagMonitor
+	monitorService     monitor.MonitorServiceInterface
 }
 
 // NewVaultEventIndexerJob builds the job. It is registered only when
@@ -54,6 +55,7 @@ func NewVaultEventIndexerJob(opts VaultEventIndexerJobOptions) Job {
 		contractID:         opts.ContractID,
 		indexFromLedger:    opts.IndexFromLedger,
 		lagMonitor:         vault.NewLagMonitor(opts.MonitorService),
+		monitorService:     opts.MonitorService,
 	}
 }
 
@@ -93,6 +95,7 @@ func (j vaultEventIndexerJob) Execute(ctx context.Context) error {
 	// gauge, and a gauge that stops being published looks the same as a
 	// healthy one that is simply not changing.
 	j.lagMonitor.Report(ctx, t.Name, j.contractID, result)
+	j.reportMissedSummaryUpdates(ctx, t.Name, result)
 
 	if result.EventsApplied > 0 || result.EventsSkipped > 0 || result.Anomalies > 0 {
 		log.Ctx(ctx).Infof(
@@ -102,6 +105,27 @@ func (j vaultEventIndexerJob) Execute(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// reportMissedSummaryUpdates increments the missed-summary-update counter once
+// per event. The warning for each event is logged by the indexer itself.
+func (j vaultEventIndexerJob) reportMissedSummaryUpdates(ctx context.Context, tenantName string, result *vault.Result) {
+	if j.monitorService == nil {
+		return
+	}
+	for eventType, count := range result.SummaryUpdatesMissed {
+		labels := map[string]string{
+			"tenant_name": tenantName,
+			"contract_id": j.contractID,
+			"event_type":  string(eventType),
+		}
+		for i := 0; i < count; i++ {
+			if err := j.monitorService.MonitorCounters(monitor.VaultIndexerSummaryUpdateMissedTag, labels); err != nil {
+				log.Ctx(ctx).Errorf("vault %s: recording a missed summary update: %v", j.contractID, err)
+				return
+			}
+		}
+	}
 }
 
 var _ Job = (*vaultEventIndexerJob)(nil)

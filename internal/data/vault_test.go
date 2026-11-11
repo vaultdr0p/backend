@@ -61,6 +61,15 @@ func bootstrapVault(t *testing.T, ctx context.Context, sqlExec db.SQLExecuter, m
 	}))
 }
 
+// applied asserts that a vault_state update succeeded and found its row.
+func applied(t *testing.T) func(StateUpdate, error) {
+	return func(update StateUpdate, err error) {
+		t.Helper()
+		require.NoError(t, err)
+		require.True(t, update.RowExists, "the summary row must exist")
+	}
+}
+
 func newVaultEvent(eventType string, eventID string, ledger int32, address string, amount *VaultAmount) VaultEvent {
 	return VaultEvent{
 		EventID:        eventID,
@@ -347,8 +356,8 @@ func Test_VaultModel_stateProjections(t *testing.T) {
 	ctx, dbConnectionPool, m := newVaultTestDB(t)
 	bootstrapVault(t, ctx, dbConnectionPool, m)
 
-	require.NoError(t, m.ApplyFundedBalance(ctx, dbConnectionPool, testVaultContractID, NewVaultAmount(60_000_000), 120))
-	require.NoError(t, m.ApplyTotalAllocated(ctx, dbConnectionPool, testVaultContractID, NewVaultAmount(10_000_000), 121))
+	applied(t)(m.ApplyFundedBalance(ctx, dbConnectionPool, testVaultContractID, NewVaultAmount(60_000_000), 120))
+	applied(t)(m.ApplyTotalAllocated(ctx, dbConnectionPool, testVaultContractID, NewVaultAmount(10_000_000), 121))
 
 	state, err := m.GetState(ctx, dbConnectionPool, testVaultContractID)
 	require.NoError(t, err)
@@ -362,11 +371,11 @@ func Test_VaultModel_stateProjectionsDoNotGoBackwards(t *testing.T) {
 	ctx, dbConnectionPool, m := newVaultTestDB(t)
 	bootstrapVault(t, ctx, dbConnectionPool, m)
 
-	require.NoError(t, m.ApplyFundedBalance(ctx, dbConnectionPool, testVaultContractID, NewVaultAmount(60_000_000), 500))
+	applied(t)(m.ApplyFundedBalance(ctx, dbConnectionPool, testVaultContractID, NewVaultAmount(60_000_000), 500))
 
 	// Re-indexing from an old cursor re-presents old events. Applying one must
 	// not publish a stale balance over a newer snapshot.
-	require.NoError(t, m.ApplyFundedBalance(ctx, dbConnectionPool, testVaultContractID, NewVaultAmount(10_000_000), 200))
+	applied(t)(m.ApplyFundedBalance(ctx, dbConnectionPool, testVaultContractID, NewVaultAmount(10_000_000), 200))
 
 	state, err := m.GetState(ctx, dbConnectionPool, testVaultContractID)
 	require.NoError(t, err)
@@ -375,7 +384,7 @@ func Test_VaultModel_stateProjectionsDoNotGoBackwards(t *testing.T) {
 
 	// An event at exactly the snapshot ledger still applies, because several
 	// events share a ledger and the later ones must not be dropped.
-	require.NoError(t, m.ApplyFundedBalance(ctx, dbConnectionPool, testVaultContractID, NewVaultAmount(70_000_000), 500))
+	applied(t)(m.ApplyFundedBalance(ctx, dbConnectionPool, testVaultContractID, NewVaultAmount(70_000_000), 500))
 	state, err = m.GetState(ctx, dbConnectionPool, testVaultContractID)
 	require.NoError(t, err)
 	assert.Equal(t, "70000000", state.Balance.String())
