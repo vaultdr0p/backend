@@ -4,7 +4,7 @@ Integrates the Soroban `disbursement-vault` contract into SDP so disbursements
 can be funded and claimed through a vault, without changing any existing SDP
 behaviour.
 
-- **Contract:** `vaultdr0p/contract`, testnet `CB5HTYC4GZW67ET23SACDCWCCDQ3AKU4TYX7SAUQJSKS6LLQLYA4HG53`
+- **Contract:** `vaultdr0p/contract` v0.1.0, testnet `CDJGWM7I3L4MJJ673AW2O5GX35Y7Z2DKPMGE4HWZFIMXMTI7KECWF2TN`. The legacy v0.0.0 instance `CB5HTYC4GZW67ET23SACDCWCCDQ3AKU4TYX7SAUQJSKS6LLQLYA4HG53` is still deployed, and the indexer handles both
 - **Feature flag:** `ENABLE_VAULT`, **default `false`**
 - **Status:** approved; implementation in progress on `feat/vault-integration`.
   Landed so far: the per-tenant migration and `RPCClient.GetEvents` with the
@@ -1067,7 +1067,7 @@ Mocks follow the existing `internal/stellar/mocks` generated-mock style, so
 - Linking vaults to SDP disbursements or receivers (schema leaves room).
 - Automatic recovery from a retention gap, which needs data the network no
   longer has.
-- Vault deployment or `initialize` from SDP; vaults are deployed out-of-band
+- Vault deployment from SDP; vaults are deployed out-of-band. Since contract v0.1.0 the deploy transaction also configures the vault, through its constructor
   and referenced by contract id.
 - Multiple tokens per vault — the contract is single-token by design.
 
@@ -1358,10 +1358,10 @@ Correctness rules. Snapshot ledger = `L`.
 |---|---|
 | Idempotent; never overwrites | `INSERT … ON CONFLICT (contract_id) DO NOTHING`. If an event created the row first, the snapshot is discarded |
 | Events at or before `L` are not applied twice | The snapshot already includes them. A new immutable column `bootstrap_ledger = L`. Every `vault_state` update in `ApplyFundedBalance`, `ApplyTotalAllocated`, `ApplyClaim`, `ApplyCancellation` and `ApplyWithdrawal` gains `AND (bootstrap_ledger IS NULL OR $ledger > bootstrap_ledger)`. Strictly greater: simulation reads state *after* ledger `L` closed |
-| A late `initialized` event cannot reset a snapshot | Its projection becomes insert-if-absent (`ON CONFLICT DO NOTHING`). `initialize` runs once per contract, so an existing row is always newer |
+| A late `initialized` event cannot reset a snapshot | Its projection becomes insert-if-absent (`ON CONFLICT DO NOTHING`). `initialized` is emitted once per contract (by `initialize` on v0.0.0, by the constructor in the deploy transaction on v0.1.0), so an existing row is always newer |
 | Allocation rows are unaffected by the guard | `RegisterAllocation` and `SettleAllocation` still apply for every new event, at any ledger: events are the only source of recipients |
 | No partial rows | All six values are decoded and validated, in memory and with the ledger check, before the single `INSERT`. Any failure means no write |
-| Nothing invented | Every column comes from a contract read. If `get_admin` and the others fail with the contract's `NotInitialized`, no row is written and the failure is reported. No zeroed or default summary is ever written |
+| Nothing invented | Every column comes from a contract read. If `get_admin` and the others fail with the contract's `NotInitialized` (possible only on a legacy v0.0.0 vault that was never initialized), no row is written and the failure is reported. No zeroed or default summary is ever written |
 
 ### 10.5 Marking the source, and being honest about allocations
 
